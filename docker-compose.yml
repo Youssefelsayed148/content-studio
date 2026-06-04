@@ -1,0 +1,43 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: content-studio-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - PORT=3002
+    volumes:
+      - content-studio-data:/data
+    networks:
+      - dokploy_default
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3002/login"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=dokploy_default
+      - traefik.http.middlewares.content-studio-redir.redirectscheme.scheme=https
+      - traefik.http.middlewares.content-studio-redir.redirectscheme.permanent=true
+      - traefik.http.routers.content-studio-http.rule=Host(`csd.theosirislabs.com`)
+      - traefik.http.routers.content-studio-http.entrypoints=web
+      - traefik.http.routers.content-studio-http.middlewares=content-studio-redir
+      - traefik.http.routers.content-studio-secure.rule=Host(`csd.theosirislabs.com`)
+      - traefik.http.routers.content-studio-secure.entrypoints=websecure
+      - traefik.http.routers.content-studio-secure.tls.certresolver=letsencrypt
+      - traefik.http.services.content-studio-svc.loadbalancer.server.port=3002
+      - traefik.http.routers.content-studio-http.service=content-studio-svc
+      - traefik.http.routers.content-studio-secure.service=content-studio-svc
+
+networks:
+  dokploy_default:
+    external: true
+
+volumes:
+  content-studio-data:

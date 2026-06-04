@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Next.js build output
+.next/
+
+# Environment (API keys! Never commit)
+.env
+.env.local
+.env.production
+
+# Data (SQLite + CSV — contains scraped data and API keys)
+data/content-studio.db
+data/api_keys.csv
+
+# OS files
+.DS_Store
+*.swp
+*.swo
+
+# IDE
+.vscode/
+.idea/
+
+# Build artifacts
+*.zip
+*.tar.gz
+
+# Logs
+*.log
+npm-debug.log*
