@@ -10,7 +10,9 @@ node_modules/
 .env.production
 
 # Data (SQLite + CSV — contains scraped data and API keys)
-data/content-studio.db
+data/*.db
+data/*.db-shm
+data/*.db-wal
 data/api_keys.csv
 
 # OS files
