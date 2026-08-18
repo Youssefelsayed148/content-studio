@@ -6,6 +6,10 @@ RUN apk add --no-cache python3 make g++
 
 COPY app/package.json ./
 RUN npm install --include=dev
+# better-sqlite3: prebuild-install can ship a glibc binary into this Alpine
+# (musl) builder; force a source compile so the native binding matches the
+# runner's libc. Fixes ERR_DLOPEN_FAILED at runtime (csd 500 on login/register).
+RUN npm rebuild better-sqlite3 --build-from-source
 
 COPY app/ .
 RUN npm run build

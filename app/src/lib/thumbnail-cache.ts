@@ -1,7 +1,13 @@
 import { writeFileSync, existsSync, mkdirSync } from "fs";
 import path from "path";
 
-const THUMBNAIL_DIR = path.join(process.cwd(), "public", "thumbnails");
+/**
+ * Where cached thumbnails live. Defaults to the container's public/ dir (baked
+ * into the image — ephemeral), but deployments should point this at the
+ * persistent /data volume so cached files survive container recreates.
+ */
+export const THUMBNAIL_DIR =
+  process.env.THUMBNAIL_DIR || path.join(process.cwd(), "public", "thumbnails");
 
 // Ensure directory exists
 if (!existsSync(THUMBNAIL_DIR)) {
@@ -30,6 +36,7 @@ async function fetchFreshThumbnailUrl(instagramUrl: string): Promise<string | nu
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
       },
+      signal: AbortSignal.timeout(20000),
     });
 
     if (!response.ok) return null;
@@ -55,7 +62,7 @@ export async function downloadThumbnail(
   videoId: string,
   instagramUrl?: string
 ): Promise<string | null> {
-  if (!url || !videoId) return null;
+  if (!videoId) return null;
 
   const filename = `${videoId}.jpg`;
   const filepath = path.join(THUMBNAIL_DIR, filename);
@@ -64,42 +71,54 @@ export async function downloadThumbnail(
   // Already cached
   if (existsSync(filepath)) return publicPath;
 
-  const imageUrls = [url];
+  // Try direct CDN URLs first (fresh URLs come from Apify post scrapes).
+  let buffer: Buffer | null = url
+    ? await fetchImage(url)
+    : null;
 
-  // If direct URL fails, try to get fresh URL from Instagram post page
-  if (instagramUrl) {
+  // If the direct URL is missing or expired, fall back to the Instagram post
+  // page's OG image. Only reached when needed — avoids an extra request per
+  // successful download.
+  if (!buffer && instagramUrl) {
     const freshUrl = await fetchFreshThumbnailUrl(instagramUrl);
     if (freshUrl && freshUrl !== url) {
-      imageUrls.push(freshUrl);
+      buffer = await fetchImage(freshUrl);
     }
   }
 
-  for (const imageUrl of imageUrls) {
-    try {
-      const response = await fetch(imageUrl, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
-          "Referer": "https://www.instagram.com/",
-        },
-      });
+  if (!buffer) return null;
 
-      if (!response.ok) continue;
+  writeFileSync(filepath, buffer);
+  return publicPath;
+}
 
-      const contentType = response.headers.get("content-type") || "";
-      if (!contentType.startsWith("image/")) continue;
+/**
+ * Fetch an image URL, validating that it is actually an image response.
+ * Returns null on any failure (bounded by a 20s timeout).
+ */
+async function fetchImage(imageUrl: string): Promise<Buffer | null> {
+  try {
+    const response = await fetch(imageUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+        "Referer": "https://www.instagram.com/",
+      },
+      signal: AbortSignal.timeout(20000),
+    });
 
-      const buffer = await response.arrayBuffer();
-      if (buffer.byteLength < 1000) continue; // Too small, probably an error page
+    if (!response.ok) return null;
 
-      writeFileSync(filepath, Buffer.from(buffer));
-      return publicPath;
-    } catch {
-      continue;
-    }
+    const contentType = response.headers.get("content-type") || "";
+    if (!contentType.startsWith("image/")) return null;
+
+    const buffer = await response.arrayBuffer();
+    if (buffer.byteLength < 1000) return null; // Too small, probably an error page
+
+    return Buffer.from(buffer);
+  } catch {
+    return null;
   }
-
-  return null;
 }
 
 /**

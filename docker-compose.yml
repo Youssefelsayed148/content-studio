@@ -10,6 +10,7 @@ services:
     environment:
       - NODE_ENV=production
       - PORT=3002
+      - THUMBNAIL_DIR=/data/thumbnails
     volumes:
       - content-studio-data:/data
     networks:

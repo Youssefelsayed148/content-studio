@@ -13,6 +13,16 @@ const nextConfig: NextConfig = {
       { protocol: "https", hostname: "scontent.cdninstagram.com" },
     ],
   },
+  async rewrites() {
+    return [
+      {
+        // Serve cached thumbnails from the persistent THUMBNAIL_DIR (see
+        // src/lib/thumbnail-cache.ts) instead of the ephemeral public/ dir.
+        source: "/thumbnails/:path*",
+        destination: "/api/thumbnails/file/:path*",
+      },
+    ];
+  },
 };
 
 export default nextConfig;

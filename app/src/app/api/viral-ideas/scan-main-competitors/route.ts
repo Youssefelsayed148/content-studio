@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { readVideos, readCreators, readViralIdeas, writeViralIdeas, appendVideo, readConfigs } from "@/lib/csv";
-import { scrapeReels } from "@/lib/apify";
+import { scrapeReels, scrapePostsByUrls } from "@/lib/apify";
+import { downloadThumbnail, getLocalThumbnailPath } from "@/lib/thumbnail-cache";
 import { detectViralVideos } from "@/lib/viral-detector";
 import { v4 as uuid } from "uuid";
 import type { ViralIdea, Video } from "@/lib/types";
@@ -120,6 +121,33 @@ export async function POST(request: Request) {
     // If ALL scrapes failed, mark fallback
     if (results.scraped.every((s) => s.error)) {
       results.fallbackUsed = true;
+    }
+
+    // Cache a thumbnail for every new video. Profile-feed scrapes frequently
+    // omit image fields (empty displayUrl/images), so after trying the scraped
+    // URL directly we re-scrape the post URLs in batches — post-level scrapes
+    // do include fresh CDN image URLs.
+    await Promise.allSettled(
+      newVideos.map((v) => downloadThumbnail(v.thumbnail, v.id, v.link))
+    );
+    const missingThumbnails = newVideos.filter((v) => !getLocalThumbnailPath(v.id));
+    if (missingThumbnails.length > 0) {
+      for (let i = 0; i < missingThumbnails.length; i += 10) {
+        const batch = missingThumbnails.slice(i, i + 10);
+        try {
+          const posts = await scrapePostsByUrls(batch.map((v) => v.link));
+          for (const post of posts) {
+            const video = batch.find((v) => v.link === post.url);
+            if (!video) continue;
+            const thumbUrl = post.displayUrl || post.images?.[0];
+            if (thumbUrl) {
+              await downloadThumbnail(thumbUrl, video.id, video.link);
+            }
+          }
+        } catch {
+          // Best-effort — a failed re-scrape must not fail the scan.
+        }
+      }
     }
 
     // 3. Run viral detection on ALL videos from main competitors (existing + new)

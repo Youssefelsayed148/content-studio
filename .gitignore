@@ -7,13 +7,17 @@ node_modules/
 # Environment (API keys! Never commit)
 .env
 .env.local
+.env*.local
 .env.production
 
 # Data (SQLite + CSV — contains scraped data and API keys)
-data/*.db
-data/*.db-shm
-data/*.db-wal
+*.db
+*.db-shm
+*.db-wal
 data/api_keys.csv
+
+# Local backups (runtime copies, never commit)
+data.bak-*/
 
 # OS files
 .DS_Store
@@ -27,6 +31,7 @@ data/api_keys.csv
 # Build artifacts
 *.zip
 *.tar.gz
+*.tsbuildinfo
 
 # Logs
 *.log

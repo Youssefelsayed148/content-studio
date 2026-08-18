@@ -3,3 +3,4 @@ app/.next
 .git
 data/*.db
 data/*.db-*
+app/public/thumbnails

@@ -48,6 +48,25 @@ import { generateGradient, getInitials } from "@/lib/gradients";
 import { sanitizeForDivido } from "@/lib/sanitize-script";
 import type { ViralIdea, Creator } from "@/lib/types";
 
+/** Pre-scan snapshot used to verify the real outcome after a client-side timeout. */
+interface ScanBaseline {
+  ideaTotal: number;
+  ideaMain: number;
+  ideaMaxDate: string | null;
+  videoTotal: number;
+  videoMaxDate: string | null;
+}
+
+function isScanResult(data: unknown): data is { success: boolean; message?: string; error?: string } {
+  return !!data && typeof data === "object" && "success" in data;
+}
+
+function sleep(ms: number): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, ms);
+  return promise;
+}
+
 export default function ViralIdeasPage() {
   const router = useRouter();
   const [ideas, setIdeas] = useState<ViralIdea[]>([]);
@@ -106,26 +125,136 @@ export default function ViralIdeasPage() {
     }
   };
 
+  /**
+   * Capture the state of viral ideas and videos before a scan starts, so we
+   * can verify the real outcome if the request times out client-side.
+   * dateDetected is the timestamp written when a new viral idea is created;
+   * dateAdded is written when a new video is scraped (mid-scan, before
+   * viral detection runs).
+   */
+  const captureScanBaseline = async (): Promise<ScanBaseline | null> => {
+    try {
+      const [ideasRes, videosRes] = await Promise.all([
+        fetch("/api/viral-ideas"),
+        fetch("/api/videos"),
+      ]);
+      if (!ideasRes.ok || !videosRes.ok) return null;
+      const ideas = (await ideasRes.json()) as ViralIdea[];
+      const videos = (await videosRes.json()) as { dateAdded?: string }[];
+      let ideaMain = 0;
+      let ideaMaxDate: string | null = null;
+      for (const idea of ideas) {
+        if (mainCompetitorUsernames.has(idea.creator)) ideaMain++;
+        if (idea.dateDetected && (!ideaMaxDate || idea.dateDetected > ideaMaxDate)) {
+          ideaMaxDate = idea.dateDetected;
+        }
+      }
+      let videoMaxDate: string | null = null;
+      for (const video of videos) {
+        if (video.dateAdded && (!videoMaxDate || video.dateAdded > videoMaxDate)) {
+          videoMaxDate = video.dateAdded;
+        }
+      }
+      return { ideaTotal: ideas.length, ideaMain, ideaMaxDate, videoTotal: videos.length, videoMaxDate };
+    } catch {
+      return null;
+    }
+  };
+
+  /**
+   * After a client-side timeout/failure, poll until the scan's real output
+   * lands (or the verification window expires) instead of guessing.
+   * Returns the number of new viral ideas found, or null if nothing changed.
+   */
+  const verifyScanOutcome = async (before: ScanBaseline) => {
+    await sleep(5000); // give the backend a few seconds before the first check
+    const deadline = Date.now() + 10 * 60 * 1000; // scan may still be running — keep checking for 10 minutes
+    let sawVideoActivity = false;
+    while (Date.now() < deadline) {
+      const after = await captureScanBaseline();
+      if (after) {
+        const newIdeas = after.ideaTotal > before.ideaTotal || after.ideaMain > before.ideaMain;
+        const newerIdeaTimestamps = !!after.ideaMaxDate && after.ideaMaxDate > (before.ideaMaxDate ?? "");
+        if (newIdeas || newerIdeaTimestamps) {
+          // Viral ideas landed — report success with the real count.
+          const mainDelta = Math.max(0, after.ideaMain - before.ideaMain);
+          const totalDelta = Math.max(0, after.ideaTotal - before.ideaTotal);
+          return { newCount: mainDelta > 0 ? mainDelta : totalDelta };
+        }
+        const newVideos = after.videoTotal > before.videoTotal;
+        const newerVideoTimestamps = !!after.videoMaxDate && after.videoMaxDate > (before.videoMaxDate ?? "");
+        if (newVideos || newerVideoTimestamps) {
+          // Videos are being scraped — the scan is running, keep waiting for ideas to land.
+          sawVideoActivity = true;
+        }
+      }
+      await sleep(15000);
+    }
+    if (sawVideoActivity) {
+      // The scan ran (new videos were scraped) but produced no new viral ideas.
+      return { newCount: 0 };
+    }
+    return null; // nothing changed — genuinely may not have completed
+  };
+
   const handleScanMainCompetitors = async () => {
     setScanningMain(true);
     setScanResult(null);
+
+    // 1. Capture the current state BEFORE starting the scan
+    const before = await captureScanBaseline();
+
+    let data: unknown = null;
     try {
       const response = await fetch("/api/viral-ideas/scan-main-competitors", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({}),
       });
-      const data = await response.json();
-      setScanResult(data);
-      if (data.success) {
-        loadIdeas();
-        setFilterTab("main"); // Auto-switch to main competitors tab
+      try {
+        data = await response.json();
+      } catch {
+        data = null; // proxy timeout pages (524/504) have no JSON body
       }
-    } catch (err) {
-      setScanResult({ success: false, error: "Failed to scan main competitors" });
-    } finally {
-      setScanningMain(false);
+    } catch {
+      // Network failure / client-side timeout — the backend may still be running.
+      // Do NOT report failure yet; verify the actual outcome below.
+      data = null;
     }
+
+    if (isScanResult(data) && data.success) {
+      setScanResult(data);
+      loadIdeas();
+      setFilterTab("main"); // Auto-switch to main competitors tab
+      setScanningMain(false);
+      return;
+    }
+
+    if (isScanResult(data)) {
+      // Definitive backend answer (e.g. no main competitors configured)
+      setScanResult(data);
+      setScanningMain(false);
+      return;
+    }
+
+    // 2. Request failed or timed out client-side — verify the real outcome
+    const verified = before ? await verifyScanOutcome(before) : null;
+    if (verified) {
+      setScanResult({
+        success: true,
+        message: verified.newCount > 0
+          ? `Scan completed in the background — found ${verified.newCount} new viral ideas`
+          : "Scan completed — no new viral ideas found",
+      });
+      loadIdeas();
+      setFilterTab("main"); // Auto-switch to main competitors tab
+    } else {
+      setScanResult({
+        success: false,
+        error: "Failed to scan main competitors — no new viral ideas or videos appeared after waiting. The scan may still be running in the background; refresh in a few minutes.",
+      });
+    }
+    setScanningMain(false);
   };
 
   const handleRefreshThumbnails = async () => {
@@ -247,7 +376,7 @@ export default function ViralIdeasPage() {
             className="bg-gradient-to-r from-red-600 to-orange-600 hover:from-red-700 hover:to-orange-700 text-white border border-red-400/30"
           >
             {scanningMain ? (
-              <><Zap className="w-4 h-4 mr-2 animate-pulse" />Scanning Main...</>
+              <><Zap className="w-4 h-4 mr-2 animate-pulse" />Scanning... this may take a few minutes</>
             ) : (
               <><Flame className="w-4 h-4 mr-2" />Scan Main Competitors</>
             )}
