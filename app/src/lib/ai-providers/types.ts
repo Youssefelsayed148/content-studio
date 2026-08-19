@@ -3,7 +3,7 @@
  * Fortune 500-quality abstraction for multi-provider AI model selection
  */
 
-export type AIProviderType = "gemini" | "anthropic" | "openai" | "openrouter";
+export type AIProviderType = "gemini" | "anthropic" | "openai" | "openrouter" | "opencode";
 
 export type AITaskType = "video-analysis" | "script-generation";
 
@@ -151,6 +151,16 @@ export const MODEL_CATALOG: ModelOption[] = [
     supportsVideo: false,
     maxTokens: 4096,
   },
+
+  // opencode-go — called directly, no dependency on Hermes or any other VPS service
+  {
+    id: "glm-5.2",
+    name: "GLM 5.2 (opencode-go)",
+    provider: "opencode",
+    description: "Default opencode-go model, called directly at opencode.ai/zen/go/v1. Falls back to kimi-k2.6 automatically per opencode-go's own config.",
+    supportsVideo: false,
+    maxTokens: 8192,
+  },
 ];
 
 export function getModelsForProvider(provider: AIProviderType): ModelOption[] {
@@ -183,8 +193,8 @@ export interface AIUserSettings {
 export const DEFAULT_AI_SETTINGS: AIUserSettings = {
   videoAnalysisProvider: "gemini",
   videoAnalysisModel: "gemini-2.0-flash",
-  scriptProvider: "anthropic",
-  scriptModel: "claude-sonnet-4-5-20250929",
+  scriptProvider: "opencode",
+  scriptModel: "glm-5.2",
 };
 
 // Provider metadata for UI
@@ -215,6 +225,12 @@ export const PROVIDER_METADATA: Record<
     description: "Unified API for 200+ models. One key, access to Claude, GPT, Gemini, and more.",
     website: "https://openrouter.ai",
     keyName: "OpenRouter API Key",
+  },
+  opencode: {
+    displayName: "opencode-go (glm-5.2)",
+    description: "Calls opencode-go's API directly (https://opencode.ai/zen/go/v1) using your own opencode-go key. No dependency on Hermes. Default model glm-5.2, automatic fallback to kimi-k2.6.",
+    website: "https://opencode.ai",
+    keyName: "opencode-go API Key",
   },
 };
 

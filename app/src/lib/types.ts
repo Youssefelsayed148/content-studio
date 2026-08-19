@@ -164,7 +164,7 @@ export interface PlatformAnalytics {
 
 export interface UserApiKey {
   id: string;
-  service: "apify" | "gemini" | "anthropic" | "openai" | "openrouter";
+  service: "apify" | "gemini" | "anthropic" | "openai" | "openrouter" | "opencode";
   keyValue: string;
   isValid: boolean;
   lastValidatedAt: string;
@@ -172,7 +172,7 @@ export interface UserApiKey {
   updatedAt: string;
 }
 
-export type AIProviderType = "gemini" | "anthropic" | "openai" | "openrouter";
+export type AIProviderType = "gemini" | "anthropic" | "openai" | "openrouter" | "opencode";
 
 export type AITaskType = "video-analysis" | "script-generation";
 

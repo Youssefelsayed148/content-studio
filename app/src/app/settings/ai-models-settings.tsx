@@ -49,6 +49,7 @@ export default function AIModelsSettings() {
     anthropic: { value: "", show: false, status: "idle", message: "" },
     openai: { value: "", show: false, status: "idle", message: "" },
     openrouter: { value: "", show: false, status: "idle", message: "" },
+    opencode: { value: "", show: false, status: "idle", message: "" },
   });
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -104,6 +105,12 @@ export default function AIModelsSettings() {
             value: keys.openrouter?.keyValue || "",
             status: keys.openrouter?.isValid ? "valid" : keys.openrouter?.keyValue ? "invalid" : "idle",
             message: keys.openrouter?.isValid ? "Key validated" : keys.openrouter?.keyValue ? "Invalid key" : "",
+          },
+          opencode: {
+            ...prev.opencode,
+            value: keys.opencode?.keyValue || "",
+            status: keys.opencode?.isValid ? "valid" : keys.opencode?.keyValue ? "invalid" : "idle",
+            message: keys.opencode?.isValid ? "Key validated" : keys.opencode?.keyValue ? "Invalid key" : "",
           },
         }));
       }
@@ -347,6 +354,7 @@ export default function AIModelsSettings() {
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
+                    <SelectItem value="opencode">opencode-go (glm-5.2)</SelectItem>
                     <SelectItem value="anthropic">Anthropic Claude</SelectItem>
                     <SelectItem value="openai">OpenAI GPT</SelectItem>
                     <SelectItem value="gemini">Google Gemini</SelectItem>
@@ -412,7 +420,7 @@ export default function AIModelsSettings() {
         </div>
 
         <div className="space-y-4">
-          {(["gemini", "anthropic", "openai", "openrouter"] as AIProviderType[]).map((provider) => {
+          {(["gemini", "anthropic", "openai", "openrouter", "opencode"] as AIProviderType[]).map((provider) => {
             const meta = PROVIDER_METADATA[provider];
             const keyState = providerKeys[provider];
             const isConfigured = keyState.status === "valid";

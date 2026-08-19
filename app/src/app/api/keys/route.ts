@@ -33,7 +33,7 @@ export async function POST(request: Request) {
   const provider = service as AIProviderType;
   let validation: { valid: boolean; error?: string };
 
-  if (["gemini", "anthropic", "openai", "openrouter"].includes(provider)) {
+  if (["gemini", "anthropic", "openai", "openrouter", "opencode"].includes(provider)) {
     validation = await validateProviderKey(provider, keyValue);
   } else if (service === "apify") {
     validation = await validateApifyKey(keyValue);

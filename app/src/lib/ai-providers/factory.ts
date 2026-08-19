@@ -15,6 +15,7 @@ import { GeminiProvider } from "./gemini-provider";
 import { ClaudeProvider } from "./claude-provider";
 import { OpenAIProvider } from "./openai-provider";
 import { OpenRouterProvider } from "./openrouter-provider";
+import { OpencodeProvider } from "./opencode-provider";
 import { readApiKeys } from "../csv";
 
 /**
@@ -63,6 +64,8 @@ export function createProvider(
       return new OpenAIProvider(apiKey, model);
     case "openrouter":
       return new OpenRouterProvider(apiKey, model);
+    case "opencode":
+      return new OpencodeProvider(apiKey, model);
     default:
       throw new Error(`Unknown provider type: ${providerType}`);
   }
@@ -82,6 +85,7 @@ export async function getApiKeyForProvider(
     anthropic: "anthropic",
     openai: "openai",
     openrouter: "openrouter",
+    opencode: "opencode",
   };
 
   const service = serviceMap[provider];
@@ -94,6 +98,7 @@ export async function getApiKeyForProvider(
     anthropic: process.env.ANTHROPIC_API_KEY,
     openai: process.env.OPENAI_API_KEY,
     openrouter: process.env.OPENROUTER_API_KEY,
+    opencode: process.env.OPENCODE_API_KEY,
   };
 
   return envMap[provider];
@@ -150,6 +155,26 @@ export async function validateProviderKey(
           return { valid: false, error: data.error?.message || `HTTP ${response.status}` };
         }
         return { valid: true };
+      }
+      case "opencode": {
+        // opencode-go is OpenAI-compatible, so /models is the standard auth probe.
+        // Only treat an explicit auth rejection (401/403) as an invalid key — if the
+        // endpoint doesn't expose /models or the network hiccups, fail open and let
+        // generateScript() surface the real error at call time rather than blocking
+        // the user from saving a key that may well be fine.
+        const base = (process.env.OPENCODE_BASE_URL || "https://opencode.ai/zen/go/v1")
+          .replace(/\/chat\/completions\/?$/, "");
+        try {
+          const response = await fetch(`${base}/models`, {
+            headers: { Authorization: `Bearer ${apiKey}` },
+          });
+          if (response.status === 401 || response.status === 403) {
+            return { valid: false, error: `Authentication failed (HTTP ${response.status})` };
+          }
+          return { valid: true };
+        } catch {
+          return { valid: true };
+        }
       }
     }
   } catch (err) {

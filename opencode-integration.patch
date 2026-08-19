@@ -1,0 +1,554 @@
+From e4ceffad7821e37a2d4d19e032dfb535863e9fc9 Mon Sep 17 00:00:00 2001
+From: Youssef Elsayed <youssef@theosirislabs.com>
+Date: Wed, 19 Aug 2026 14:34:37 +0000
+Subject: [PATCH] Add opencode-go (glm-5.2) AI provider; fix
+ scan-main-competitors to generate real adapted scripts
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- New OpencodeProvider (lib/ai-providers/opencode-provider.ts) calls opencode-go
+  directly at https://opencode.ai/zen/go/v1 (OpenAI-compatible chat completions).
+  Standalone HTTP client with no dependency on Hermes or any other VPS service —
+  Hermes just happens to use the same opencode-go endpoint for its own purposes.
+  Set as new default script provider.
+- Registered in factory.ts, both AIProviderType unions, csv.ts validation,
+  api/keys/route.ts, and Settings UI. Credential expected as OPENCODE_API_KEY
+  (own key for Content Studio, not shared with Hermes).
+- scan-main-competitors/route.ts: replaced hardcoded newConcepts: "" and the
+  fabricated "API quota exceeded" fallback with real AI script generation,
+  bounded to the top 8 ideas per scan (3 concurrent) to stay under the
+  Cloudflare request timeout. Unreached ideas get an honest pending message.
+---
+ app/src/app/api/keys/route.ts                 |   2 +-
+ .../scan-main-competitors/route.ts            | 129 ++++++++++++++++--
+ app/src/app/settings/ai-models-settings.tsx   |  10 +-
+ app/src/lib/ai-providers/factory.ts           |  25 ++++
+ app/src/lib/ai-providers/opencode-provider.ts | 120 ++++++++++++++++
+ app/src/lib/ai-providers/types.ts             |  22 ++-
+ app/src/lib/csv.ts                            |   2 +-
+ app/src/lib/types.ts                          |   4 +-
+ 8 files changed, 298 insertions(+), 16 deletions(-)
+ create mode 100644 app/src/lib/ai-providers/opencode-provider.ts
+
+diff --git a/app/src/app/api/keys/route.ts b/app/src/app/api/keys/route.ts
+index 17fc814..3ef71bb 100644
+--- a/app/src/app/api/keys/route.ts
++++ b/app/src/app/api/keys/route.ts
+@@ -33,7 +33,7 @@ export async function POST(request: Request) {
+   const provider = service as AIProviderType;
+   let validation: { valid: boolean; error?: string };
+ 
+-  if (["gemini", "anthropic", "openai", "openrouter"].includes(provider)) {
++  if (["gemini", "anthropic", "openai", "openrouter", "opencode"].includes(provider)) {
+     validation = await validateProviderKey(provider, keyValue);
+   } else if (service === "apify") {
+     validation = await validateApifyKey(keyValue);
+diff --git a/app/src/app/api/viral-ideas/scan-main-competitors/route.ts b/app/src/app/api/viral-ideas/scan-main-competitors/route.ts
+index f94b728..a06cfa8 100644
+--- a/app/src/app/api/viral-ideas/scan-main-competitors/route.ts
++++ b/app/src/app/api/viral-ideas/scan-main-competitors/route.ts
+@@ -1,14 +1,22 @@
+ import { NextResponse } from "next/server";
+-import { readVideos, readCreators, readViralIdeas, writeViralIdeas, appendVideo, readConfigs } from "@/lib/csv";
++import { readVideos, readCreators, readViralIdeas, writeViralIdeas, appendVideo, readConfigs, readAiSettings } from "@/lib/csv";
+ import { scrapeReels, scrapePostsByUrls } from "@/lib/apify";
+ import { downloadThumbnail, getLocalThumbnailPath } from "@/lib/thumbnail-cache";
+ import { detectViralVideos } from "@/lib/viral-detector";
++import { getProviderForTask } from "@/lib/ai-providers/factory";
+ import { v4 as uuid } from "uuid";
+-import type { ViralIdea, Video } from "@/lib/types";
++import type { ViralIdea, Video, Config } from "@/lib/types";
+ 
+ const MAIN_COMPETITOR_LOOKBACK_DAYS = 120;
+ const VIRAL_THRESHOLD = 1.2;
+ 
++// Bounds on AI script generation per scan. Each generation is a full AI
++// round-trip, so these keep total wall time well under the Cloudflare/proxy
++// request timeout. Ideas beyond the cap are saved with a "not generated yet"
++// placeholder rather than a fabricated error.
++const MAX_SCRIPT_GENERATIONS_PER_SCAN = 8;
++const SCRIPT_GENERATION_CONCURRENCY = 3;
++
+ /**
+  * Dedicated endpoint for scanning main competitors.
+  * 
+@@ -27,6 +35,8 @@ export async function POST(request: Request) {
+     newVideosSaved: 0,
+     viralDetected: 0,
+     newViralIdeas: 0,
++    scriptsGenerated: 0,
++    scriptsFailed: 0,
+     errors: [] as string[],
+     fallbackUsed: false,
+   };
+@@ -168,7 +178,6 @@ export async function POST(request: Request) {
+       if (existingViralIds.has(video.id)) continue;
+ 
+       const originalParts = extractOriginalScript(video.analysis);
+-      const adaptedParts = extractAdaptedScript(video.newConcepts);
+       const sevenBricksAnalysis = generateSevenBricksFromVideo(video, result);
+ 
+       const viralIdea: ViralIdea = {
+@@ -182,14 +191,17 @@ export async function POST(request: Request) {
+         comments: video.comments,
+         creatorAvgViews: result.creatorAvgViews,
+         viralMultiplier: result.viralMultiplier,
+-        originalScript: video.analysis || `Video from @${video.creator} — ${video.views.toLocaleString()} views. No AI analysis available (API quota exceeded).`,
++        originalScript: video.analysis || `Video from @${video.creator} — ${video.views.toLocaleString()} views. No AI analysis available for this video yet.`,
+         originalHook: originalParts.hook || "No hook extracted",
+         originalBody: originalParts.body || "No body extracted",
+         originalCTA: originalParts.cta || "No CTA extracted",
+-        adaptedScript: video.newConcepts || "No adapted script available (API quota exceeded).",
+-        adaptedHook: adaptedParts.hook || "",
+-        adaptedBody: adaptedParts.body || "",
+-        adaptedCTA: adaptedParts.cta || "",
++        // Populated below in the bounded script-generation phase. Anything not
++        // reached this run stays honestly labelled as pending rather than being
++        // dressed up as a quota error.
++        adaptedScript: "Script not generated yet — re-run the scan or generate from the Scripts view.",
++        adaptedHook: "",
++        adaptedBody: "",
++        adaptedCTA: "",
+         sevenBricksAnalysis,
+         contentPillar: extractContentPillar(video.analysis),
+         status: "detected",
+@@ -205,6 +217,45 @@ export async function POST(request: Request) {
+       newViralIdeas.push(viralIdea);
+     }
+ 
++    // Generate adapted scripts for the strongest new ideas only.
++    //
++    // Each generation is a full AI round-trip (~20-40s on glm-5.2), so this is
++    // deliberately bounded on two axes: MAX_SCRIPT_GENERATIONS_PER_SCAN caps the
++    // total, and SCRIPT_GENERATION_CONCURRENCY caps how many run at once. Without
++    // both, a scan detecting dozens of new videos would run serial AI calls for
++    // many minutes and blow the Cloudflare request timeout. Ideas beyond the cap
++    // are still saved — they just keep the honest "not generated yet" placeholder.
++    const scriptTargets = [...newViralIdeas]
++      .sort((a, b) => b.viralMultiplier - a.viralMultiplier)
++      .slice(0, MAX_SCRIPT_GENERATIONS_PER_SCAN);
++
++    let scriptsGenerated = 0;
++    let scriptsFailed = 0;
++
++    for (let i = 0; i < scriptTargets.length; i += SCRIPT_GENERATION_CONCURRENCY) {
++      const batch = scriptTargets.slice(i, i + SCRIPT_GENERATION_CONCURRENCY);
++      await Promise.all(
++        batch.map(async (idea) => {
++          const generated = await generateAdaptedScript(idea, config);
++          if (generated.ok) {
++            const parts = extractAdaptedScript(generated.text);
++            idea.adaptedScript = generated.text;
++            idea.adaptedHook = parts.hook;
++            idea.adaptedBody = parts.body;
++            idea.adaptedCTA = parts.cta;
++            idea.dateScripted = new Date().toISOString();
++            scriptsGenerated++;
++          } else {
++            idea.adaptedScript = `Script generation failed: ${generated.error}`;
++            scriptsFailed++;
++          }
++        })
++      );
++    }
++
++    results.scriptsGenerated = scriptsGenerated;
++    results.scriptsFailed = scriptsFailed;
++
+     if (newViralIdeas.length > 0) {
+       const existing = readViralIdeas();
+       writeViralIdeas([...existing, ...newViralIdeas]);
+@@ -230,6 +281,68 @@ export async function POST(request: Request) {
+   }
+ }
+ 
++/**
++ * Generate the brand-adapted script via the configured AI provider
++ * (opencode-go / glm-5.2 by default — see DEFAULT_AI_SETTINGS in ai-providers/types.ts).
++ * Mirrors the pattern used in lib/process-viral.ts's runBrandScriptGeneration.
++ * Returns an honest ok/error result rather than masking failures behind a
++ * fabricated "quota exceeded" message.
++ */
++async function generateAdaptedScript(
++  idea: ViralIdea,
++  config: Config | undefined
++): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
++  try {
++    const aiSettings = readAiSettings();
++    const scriptProvider = await getProviderForTask("script-generation", aiSettings || undefined);
++
++    const viralContext = `
++---
++VIRAL VIDEO REFERENCE
++=====================
++Creator: @${idea.creator}
++Views: ${idea.views.toLocaleString()}
++Viral Multiplier: ${idea.viralMultiplier.toFixed(1)}x above this creator's average
++Link: ${idea.link}
++`;
++
++    const baseInstruction =
++      config?.newConceptsInstruction ||
++      "Adapt this competitor's viral video into a new concept for our brand.";
++
++    const scriptPrompt = `${baseInstruction}
++
++${viralContext}
++
++7 BRICKS FORENSIC ANALYSIS (use this to understand the viral mechanics):
++${idea.sevenBricksAnalysis}
++
++---
++
++TASK: Generate ONE complete, production-ready script with:
++- Hook (0-3s): Visual + Spoken + Text
++- Body (3-50s): Scene-by-scene breakdown
++- CTA (50-60s): Native embed call-to-action
++- Production notes: Talent, location, props, B-roll, audio
++
++Format the output with "## HOOK", "## BODY", and "## CTA" section headers.`;
++
++    const text = await scriptProvider.generateScript(
++      idea.sevenBricksAnalysis,
++      scriptPrompt,
++      undefined
++    );
++
++    if (!text || !text.trim()) {
++      return { ok: false, error: "Provider returned an empty response" };
++    }
++
++    return { ok: true, text };
++  } catch (err) {
++    return { ok: false, error: err instanceof Error ? err.message : String(err) };
++  }
++}
++
+ function extractOriginalScript(analysis: string): { hook: string; body: string; cta: string } {
+   if (!analysis) return { hook: "", body: "", cta: "" };
+   
+diff --git a/app/src/app/settings/ai-models-settings.tsx b/app/src/app/settings/ai-models-settings.tsx
+index d0a77e4..6602f0c 100644
+--- a/app/src/app/settings/ai-models-settings.tsx
++++ b/app/src/app/settings/ai-models-settings.tsx
+@@ -49,6 +49,7 @@ export default function AIModelsSettings() {
+     anthropic: { value: "", show: false, status: "idle", message: "" },
+     openai: { value: "", show: false, status: "idle", message: "" },
+     openrouter: { value: "", show: false, status: "idle", message: "" },
++    opencode: { value: "", show: false, status: "idle", message: "" },
+   });
+   const [saving, setSaving] = useState(false);
+   const [saved, setSaved] = useState(false);
+@@ -105,6 +106,12 @@ export default function AIModelsSettings() {
+             status: keys.openrouter?.isValid ? "valid" : keys.openrouter?.keyValue ? "invalid" : "idle",
+             message: keys.openrouter?.isValid ? "Key validated" : keys.openrouter?.keyValue ? "Invalid key" : "",
+           },
++          opencode: {
++            ...prev.opencode,
++            value: keys.opencode?.keyValue || "",
++            status: keys.opencode?.isValid ? "valid" : keys.opencode?.keyValue ? "invalid" : "idle",
++            message: keys.opencode?.isValid ? "Key validated" : keys.opencode?.keyValue ? "Invalid key" : "",
++          },
+         }));
+       }
+     } catch (err) {
+@@ -347,6 +354,7 @@ export default function AIModelsSettings() {
+                     <SelectValue />
+                   </SelectTrigger>
+                   <SelectContent>
++                    <SelectItem value="opencode">opencode-go (glm-5.2)</SelectItem>
+                     <SelectItem value="anthropic">Anthropic Claude</SelectItem>
+                     <SelectItem value="openai">OpenAI GPT</SelectItem>
+                     <SelectItem value="gemini">Google Gemini</SelectItem>
+@@ -412,7 +420,7 @@ export default function AIModelsSettings() {
+         </div>
+ 
+         <div className="space-y-4">
+-          {(["gemini", "anthropic", "openai", "openrouter"] as AIProviderType[]).map((provider) => {
++          {(["gemini", "anthropic", "openai", "openrouter", "opencode"] as AIProviderType[]).map((provider) => {
+             const meta = PROVIDER_METADATA[provider];
+             const keyState = providerKeys[provider];
+             const isConfigured = keyState.status === "valid";
+diff --git a/app/src/lib/ai-providers/factory.ts b/app/src/lib/ai-providers/factory.ts
+index 078b78f..884461e 100644
+--- a/app/src/lib/ai-providers/factory.ts
++++ b/app/src/lib/ai-providers/factory.ts
+@@ -15,6 +15,7 @@ import { GeminiProvider } from "./gemini-provider";
+ import { ClaudeProvider } from "./claude-provider";
+ import { OpenAIProvider } from "./openai-provider";
+ import { OpenRouterProvider } from "./openrouter-provider";
++import { OpencodeProvider } from "./opencode-provider";
+ import { readApiKeys } from "../csv";
+ 
+ /**
+@@ -63,6 +64,8 @@ export function createProvider(
+       return new OpenAIProvider(apiKey, model);
+     case "openrouter":
+       return new OpenRouterProvider(apiKey, model);
++    case "opencode":
++      return new OpencodeProvider(apiKey, model);
+     default:
+       throw new Error(`Unknown provider type: ${providerType}`);
+   }
+@@ -82,6 +85,7 @@ export async function getApiKeyForProvider(
+     anthropic: "anthropic",
+     openai: "openai",
+     openrouter: "openrouter",
++    opencode: "opencode",
+   };
+ 
+   const service = serviceMap[provider];
+@@ -94,6 +98,7 @@ export async function getApiKeyForProvider(
+     anthropic: process.env.ANTHROPIC_API_KEY,
+     openai: process.env.OPENAI_API_KEY,
+     openrouter: process.env.OPENROUTER_API_KEY,
++    opencode: process.env.OPENCODE_API_KEY,
+   };
+ 
+   return envMap[provider];
+@@ -151,6 +156,26 @@ export async function validateProviderKey(
+         }
+         return { valid: true };
+       }
++      case "opencode": {
++        // opencode-go is OpenAI-compatible, so /models is the standard auth probe.
++        // Only treat an explicit auth rejection (401/403) as an invalid key — if the
++        // endpoint doesn't expose /models or the network hiccups, fail open and let
++        // generateScript() surface the real error at call time rather than blocking
++        // the user from saving a key that may well be fine.
++        const base = (process.env.OPENCODE_BASE_URL || "https://opencode.ai/zen/go/v1")
++          .replace(/\/chat\/completions\/?$/, "");
++        try {
++          const response = await fetch(`${base}/models`, {
++            headers: { Authorization: `Bearer ${apiKey}` },
++          });
++          if (response.status === 401 || response.status === 403) {
++            return { valid: false, error: `Authentication failed (HTTP ${response.status})` };
++          }
++          return { valid: true };
++        } catch {
++          return { valid: true };
++        }
++      }
+     }
+   } catch (err) {
+     return { valid: false, error: err instanceof Error ? err.message : String(err) };
+diff --git a/app/src/lib/ai-providers/opencode-provider.ts b/app/src/lib/ai-providers/opencode-provider.ts
+new file mode 100644
+index 0000000..d574152
+--- /dev/null
++++ b/app/src/lib/ai-providers/opencode-provider.ts
+@@ -0,0 +1,120 @@
++/**
++ * opencode-go Provider (glm-5.2)
++ * Calls opencode-go's API directly using your own opencode-go credential.
++ * This has no dependency on Hermes or any other service on the VPS — it's
++ * a standalone HTTP client, same pattern as the OpenRouter provider.
++ *
++ *   base_url: https://opencode.ai/zen/go/v1
++ *   wire format: chat_completions (OpenAI-compatible)
++ *   default model: glm-5.2, fallback: kimi-k2.6 (handled server-side by opencode-go)
++ */
++
++import type { AIProvider } from "./types";
++
++/** Max wait for a single generation before aborting. */
++const REQUEST_TIMEOUT_MS = 120_000;
++
++/**
++ * Accepts OPENCODE_BASE_URL either as the bare base
++ * (https://opencode.ai/zen/go/v1) or with /chat/completions already
++ * appended. Normalizes to the full endpoint so either form in .env works.
++ */
++function resolveEndpoint(): string {
++  const raw = (process.env.OPENCODE_BASE_URL || "https://opencode.ai/zen/go/v1").trim().replace(/\/+$/, "");
++  return raw.endsWith("/chat/completions") ? raw : `${raw}/chat/completions`;
++}
++
++export class OpencodeProvider implements AIProvider {
++  readonly providerType = "opencode" as const;
++  readonly displayName = "opencode-go (glm-5.2)";
++  private model: string;
++  private apiKey: string;
++
++  constructor(apiKey: string, model: string = "glm-5.2") {
++    this.apiKey = apiKey;
++    this.model = model;
++  }
++
++  async analyzeVideo(
++    _videoBuffer: Buffer,
++    _mimeType: string,
++    _analysisPrompt: string
++  ): Promise<string> {
++    throw new Error(
++      "opencode-go (glm-5.2) does not support native video analysis. Please use Gemini for video analysis, or select Gemini as your video analysis provider in Settings."
++    );
++  }
++
++  async generateScript(
++    videoAnalysis: string,
++    instructions: string,
++    brandVoice?: string
++  ): Promise<string> {
++    const brandVoiceSection = brandVoice
++      ? `
++# BRAND VOICE (STRICT — ALL OUTPUT MUST FOLLOW THIS)
++------
++${brandVoice}
++------
++`
++      : "";
++
++    const response = await fetch(resolveEndpoint(), {
++      method: "POST",
++      // Bound the request so a hung upstream call can't stall the caller
++      // indefinitely (the scan route runs several of these per batch).
++      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
++      headers: {
++        "Content-Type": "application/json",
++        Authorization: `Bearer ${this.apiKey}`,
++      },
++      body: JSON.stringify({
++        model: this.model,
++        max_tokens: 8192,
++        temperature: 0.7,
++        messages: [
++          {
++            role: "system",
++            content:
++              "You are an expert in creating viral Instagram Reels. You analyze competitor content and generate adapted concepts for brands. CRITICAL: NEVER mention competitor names, brands, or locations. Always use generic terms like 'our agent', 'our platform', 'Cairo', 'EGP'.",
++          },
++          {
++            role: "user",
++            content: `# OBJECTIVE
++Take as input a viral video from my competitor and generate new concepts adapted for my brand.
++
++# CRITICAL RULES
++- NEVER mention competitor names (Fabo, Ryan Serhant, Marcel Remus, Grant Cardone, etc.)
++- NEVER mention competitor brands (Nawy, Stake, SmartCrowd, etc.)
++- NEVER mention competitor locations (Dubai, Dubai Marina, Palm Jumeirah, etc.)
++- Use "our agent", "our investor", "our platform" instead of specific names
++- Use "Cairo", "New Cairo", "Sheikh Zayed" instead of Dubai locations
++- Use "EGP" instead of "$" for currency
++- This is for Divido — Egypt's fractional real estate platform
++
++# REFERENCE VIDEO DESCRIPTION
++------
++${videoAnalysis}
++------
++
++# MY INSTRUCTIONS FOR NEW CONCEPTS
++------
++${instructions}
++------
++${brandVoiceSection}# BEGIN YOUR WORK`,
++          },
++        ],
++      }),
++    });
++
++    if (!response.ok) {
++      const error = await response.text();
++      throw new Error(`opencode-go error ${response.status}: ${error}`);
++    }
++
++    const data = await response.json();
++    const text = data.choices?.[0]?.message?.content || "";
++    const hashIndex = text.indexOf("#");
++    return hashIndex >= 0 ? text.substring(hashIndex) : text;
++  }
++}
+diff --git a/app/src/lib/ai-providers/types.ts b/app/src/lib/ai-providers/types.ts
+index a12e5ac..2952e21 100644
+--- a/app/src/lib/ai-providers/types.ts
++++ b/app/src/lib/ai-providers/types.ts
+@@ -3,7 +3,7 @@
+  * Fortune 500-quality abstraction for multi-provider AI model selection
+  */
+ 
+-export type AIProviderType = "gemini" | "anthropic" | "openai" | "openrouter";
++export type AIProviderType = "gemini" | "anthropic" | "openai" | "openrouter" | "opencode";
+ 
+ export type AITaskType = "video-analysis" | "script-generation";
+ 
+@@ -151,6 +151,16 @@ export const MODEL_CATALOG: ModelOption[] = [
+     supportsVideo: false,
+     maxTokens: 4096,
+   },
++
++  // opencode-go — called directly, no dependency on Hermes or any other VPS service
++  {
++    id: "glm-5.2",
++    name: "GLM 5.2 (opencode-go)",
++    provider: "opencode",
++    description: "Default opencode-go model, called directly at opencode.ai/zen/go/v1. Falls back to kimi-k2.6 automatically per opencode-go's own config.",
++    supportsVideo: false,
++    maxTokens: 8192,
++  },
+ ];
+ 
+ export function getModelsForProvider(provider: AIProviderType): ModelOption[] {
+@@ -183,8 +193,8 @@ export interface AIUserSettings {
+ export const DEFAULT_AI_SETTINGS: AIUserSettings = {
+   videoAnalysisProvider: "gemini",
+   videoAnalysisModel: "gemini-2.0-flash",
+-  scriptProvider: "anthropic",
+-  scriptModel: "claude-sonnet-4-5-20250929",
++  scriptProvider: "opencode",
++  scriptModel: "glm-5.2",
+ };
+ 
+ // Provider metadata for UI
+@@ -216,6 +226,12 @@ export const PROVIDER_METADATA: Record<
+     website: "https://openrouter.ai",
+     keyName: "OpenRouter API Key",
+   },
++  opencode: {
++    displayName: "opencode-go (glm-5.2)",
++    description: "Calls opencode-go's API directly (https://opencode.ai/zen/go/v1) using your own opencode-go key. No dependency on Hermes. Default model glm-5.2, automatic fallback to kimi-k2.6.",
++    website: "https://opencode.ai",
++    keyName: "opencode-go API Key",
++  },
+ };
+ 
+ // Map provider type to the service name used in api_keys.csv
+diff --git a/app/src/lib/csv.ts b/app/src/lib/csv.ts
+index bfe0f1c..89e727c 100644
+--- a/app/src/lib/csv.ts
++++ b/app/src/lib/csv.ts
+@@ -448,7 +448,7 @@ export function readAiSettings(workspaceId?: string): import("./types").AIUserSe
+     ? db.prepare("SELECT * FROM ai_settings WHERE workspace_id = ?").get(workspaceId)
+     : db.prepare("SELECT * FROM ai_settings LIMIT 1").get();
+   if (!row) return null;
+-  const validProviders = ["gemini", "anthropic", "openai", "openrouter"] as const;
++  const validProviders = ["gemini", "anthropic", "openai", "openrouter", "opencode"] as const;
+   const parseProvider = (p: string): import("./types").AIProviderType => {
+     return validProviders.includes(p as import("./types").AIProviderType) ? (p as import("./types").AIProviderType) : "gemini";
+   };
+diff --git a/app/src/lib/types.ts b/app/src/lib/types.ts
+index 3c49dc3..4164b13 100644
+--- a/app/src/lib/types.ts
++++ b/app/src/lib/types.ts
+@@ -164,7 +164,7 @@ export interface PlatformAnalytics {
+ 
+ export interface UserApiKey {
+   id: string;
+-  service: "apify" | "gemini" | "anthropic" | "openai" | "openrouter";
++  service: "apify" | "gemini" | "anthropic" | "openai" | "openrouter" | "opencode";
+   keyValue: string;
+   isValid: boolean;
+   lastValidatedAt: string;
+@@ -172,7 +172,7 @@ export interface UserApiKey {
+   updatedAt: string;
+ }
+ 
+-export type AIProviderType = "gemini" | "anthropic" | "openai" | "openrouter";
++export type AIProviderType = "gemini" | "anthropic" | "openai" | "openrouter" | "opencode";
+ 
+ export type AITaskType = "video-analysis" | "script-generation";
+ 
+-- 
+2.43.0
+

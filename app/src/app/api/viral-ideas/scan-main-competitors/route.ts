@@ -1,13 +1,21 @@
 import { NextResponse } from "next/server";
-import { readVideos, readCreators, readViralIdeas, writeViralIdeas, appendVideo, readConfigs } from "@/lib/csv";
+import { readVideos, readCreators, readViralIdeas, writeViralIdeas, appendVideo, readConfigs, readAiSettings } from "@/lib/csv";
 import { scrapeReels, scrapePostsByUrls } from "@/lib/apify";
 import { downloadThumbnail, getLocalThumbnailPath } from "@/lib/thumbnail-cache";
 import { detectViralVideos } from "@/lib/viral-detector";
+import { getProviderForTask } from "@/lib/ai-providers/factory";
 import { v4 as uuid } from "uuid";
-import type { ViralIdea, Video } from "@/lib/types";
+import type { ViralIdea, Video, Config } from "@/lib/types";
 
 const MAIN_COMPETITOR_LOOKBACK_DAYS = 120;
 const VIRAL_THRESHOLD = 1.2;
+
+// Bounds on AI script generation per scan. Each generation is a full AI
+// round-trip, so these keep total wall time well under the Cloudflare/proxy
+// request timeout. Ideas beyond the cap are saved with a "not generated yet"
+// placeholder rather than a fabricated error.
+const MAX_SCRIPT_GENERATIONS_PER_SCAN = 8;
+const SCRIPT_GENERATION_CONCURRENCY = 3;
 
 /**
  * Dedicated endpoint for scanning main competitors.
@@ -27,6 +35,8 @@ export async function POST(request: Request) {
     newVideosSaved: 0,
     viralDetected: 0,
     newViralIdeas: 0,
+    scriptsGenerated: 0,
+    scriptsFailed: 0,
     errors: [] as string[],
     fallbackUsed: false,
   };
@@ -168,7 +178,6 @@ export async function POST(request: Request) {
       if (existingViralIds.has(video.id)) continue;
 
       const originalParts = extractOriginalScript(video.analysis);
-      const adaptedParts = extractAdaptedScript(video.newConcepts);
       const sevenBricksAnalysis = generateSevenBricksFromVideo(video, result);
 
       const viralIdea: ViralIdea = {
@@ -182,14 +191,17 @@ export async function POST(request: Request) {
         comments: video.comments,
         creatorAvgViews: result.creatorAvgViews,
         viralMultiplier: result.viralMultiplier,
-        originalScript: video.analysis || `Video from @${video.creator} — ${video.views.toLocaleString()} views. No AI analysis available (API quota exceeded).`,
+        originalScript: video.analysis || `Video from @${video.creator} — ${video.views.toLocaleString()} views. No AI analysis available for this video yet.`,
         originalHook: originalParts.hook || "No hook extracted",
         originalBody: originalParts.body || "No body extracted",
         originalCTA: originalParts.cta || "No CTA extracted",
-        adaptedScript: video.newConcepts || "No adapted script available (API quota exceeded).",
-        adaptedHook: adaptedParts.hook || "",
-        adaptedBody: adaptedParts.body || "",
-        adaptedCTA: adaptedParts.cta || "",
+        // Populated below in the bounded script-generation phase. Anything not
+        // reached this run stays honestly labelled as pending rather than being
+        // dressed up as a quota error.
+        adaptedScript: "Script not generated yet — re-run the scan or generate from the Scripts view.",
+        adaptedHook: "",
+        adaptedBody: "",
+        adaptedCTA: "",
         sevenBricksAnalysis,
         contentPillar: extractContentPillar(video.analysis),
         status: "detected",
@@ -204,6 +216,45 @@ export async function POST(request: Request) {
 
       newViralIdeas.push(viralIdea);
     }
+
+    // Generate adapted scripts for the strongest new ideas only.
+    //
+    // Each generation is a full AI round-trip (~20-40s on glm-5.2), so this is
+    // deliberately bounded on two axes: MAX_SCRIPT_GENERATIONS_PER_SCAN caps the
+    // total, and SCRIPT_GENERATION_CONCURRENCY caps how many run at once. Without
+    // both, a scan detecting dozens of new videos would run serial AI calls for
+    // many minutes and blow the Cloudflare request timeout. Ideas beyond the cap
+    // are still saved — they just keep the honest "not generated yet" placeholder.
+    const scriptTargets = [...newViralIdeas]
+      .sort((a, b) => b.viralMultiplier - a.viralMultiplier)
+      .slice(0, MAX_SCRIPT_GENERATIONS_PER_SCAN);
+
+    let scriptsGenerated = 0;
+    let scriptsFailed = 0;
+
+    for (let i = 0; i < scriptTargets.length; i += SCRIPT_GENERATION_CONCURRENCY) {
+      const batch = scriptTargets.slice(i, i + SCRIPT_GENERATION_CONCURRENCY);
+      await Promise.all(
+        batch.map(async (idea) => {
+          const generated = await generateAdaptedScript(idea, config);
+          if (generated.ok) {
+            const parts = extractAdaptedScript(generated.text);
+            idea.adaptedScript = generated.text;
+            idea.adaptedHook = parts.hook;
+            idea.adaptedBody = parts.body;
+            idea.adaptedCTA = parts.cta;
+            idea.dateScripted = new Date().toISOString();
+            scriptsGenerated++;
+          } else {
+            idea.adaptedScript = `Script generation failed: ${generated.error}`;
+            scriptsFailed++;
+          }
+        })
+      );
+    }
+
+    results.scriptsGenerated = scriptsGenerated;
+    results.scriptsFailed = scriptsFailed;
 
     if (newViralIdeas.length > 0) {
       const existing = readViralIdeas();
@@ -227,6 +278,68 @@ export async function POST(request: Request) {
       },
       { status: 500 }
     );
+  }
+}
+
+/**
+ * Generate the brand-adapted script via the configured AI provider
+ * (opencode-go / glm-5.2 by default — see DEFAULT_AI_SETTINGS in ai-providers/types.ts).
+ * Mirrors the pattern used in lib/process-viral.ts's runBrandScriptGeneration.
+ * Returns an honest ok/error result rather than masking failures behind a
+ * fabricated "quota exceeded" message.
+ */
+async function generateAdaptedScript(
+  idea: ViralIdea,
+  config: Config | undefined
+): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
+  try {
+    const aiSettings = readAiSettings();
+    const scriptProvider = await getProviderForTask("script-generation", aiSettings || undefined);
+
+    const viralContext = `
+---
+VIRAL VIDEO REFERENCE
+=====================
+Creator: @${idea.creator}
+Views: ${idea.views.toLocaleString()}
+Viral Multiplier: ${idea.viralMultiplier.toFixed(1)}x above this creator's average
+Link: ${idea.link}
+`;
+
+    const baseInstruction =
+      config?.newConceptsInstruction ||
+      "Adapt this competitor's viral video into a new concept for our brand.";
+
+    const scriptPrompt = `${baseInstruction}
+
+${viralContext}
+
+7 BRICKS FORENSIC ANALYSIS (use this to understand the viral mechanics):
+${idea.sevenBricksAnalysis}
+
+---
+
+TASK: Generate ONE complete, production-ready script with:
+- Hook (0-3s): Visual + Spoken + Text
+- Body (3-50s): Scene-by-scene breakdown
+- CTA (50-60s): Native embed call-to-action
+- Production notes: Talent, location, props, B-roll, audio
+
+Format the output with "## HOOK", "## BODY", and "## CTA" section headers.`;
+
+    const text = await scriptProvider.generateScript(
+      idea.sevenBricksAnalysis,
+      scriptPrompt,
+      undefined
+    );
+
+    if (!text || !text.trim()) {
+      return { ok: false, error: "Provider returned an empty response" };
+    }
+
+    return { ok: true, text };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
 }
 

@@ -448,7 +448,7 @@ export function readAiSettings(workspaceId?: string): import("./types").AIUserSe
     ? db.prepare("SELECT * FROM ai_settings WHERE workspace_id = ?").get(workspaceId)
     : db.prepare("SELECT * FROM ai_settings LIMIT 1").get();
   if (!row) return null;
-  const validProviders = ["gemini", "anthropic", "openai", "openrouter"] as const;
+  const validProviders = ["gemini", "anthropic", "openai", "openrouter", "opencode"] as const;
   const parseProvider = (p: string): import("./types").AIProviderType => {
     return validProviders.includes(p as import("./types").AIProviderType) ? (p as import("./types").AIProviderType) : "gemini";
   };
