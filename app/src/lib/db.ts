@@ -306,4 +306,23 @@ CREATE TABLE IF NOT EXISTS usage_records (
   timestamp TEXT,
   details TEXT
 );
+
+-- Background scan jobs (e.g. "Scan Main Competitors"). Lets a slow scrape+AI
+-- pipeline run past the Cloudflare/proxy request timeout: the POST route
+-- creates a row and returns immediately, the actual work updates this row
+-- as it progresses, and the frontend polls GET /scan-status/:id instead of
+-- holding one long-lived request open.
+CREATE TABLE IF NOT EXISTS scan_jobs (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+  status TEXT NOT NULL DEFAULT 'running', -- running | done | failed
+  configName TEXT,
+  progressStep TEXT,
+  progressCurrent INTEGER DEFAULT 0,
+  progressTotal INTEGER DEFAULT 0,
+  result TEXT,
+  error TEXT,
+  createdAt TEXT NOT NULL,
+  updatedAt TEXT NOT NULL
+);
 `;

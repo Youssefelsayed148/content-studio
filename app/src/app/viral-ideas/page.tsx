@@ -48,17 +48,15 @@ import { generateGradient, getInitials } from "@/lib/gradients";
 import { sanitizeForDivido } from "@/lib/sanitize-script";
 import type { ViralIdea, Creator } from "@/lib/types";
 
-/** Pre-scan snapshot used to verify the real outcome after a client-side timeout. */
-interface ScanBaseline {
-  ideaTotal: number;
-  ideaMain: number;
-  ideaMaxDate: string | null;
-  videoTotal: number;
-  videoMaxDate: string | null;
-}
-
-function isScanResult(data: unknown): data is { success: boolean; message?: string; error?: string } {
-  return !!data && typeof data === "object" && "success" in data;
+/** Shape of a row from GET /api/viral-ideas/scan-status/:jobId */
+interface ScanJobStatus {
+  id: string;
+  status: "running" | "done" | "failed";
+  progressStep: string | null;
+  progressCurrent: number;
+  progressTotal: number;
+  result: { success: boolean; message?: string; error?: string; [key: string]: unknown } | null;
+  error: string | null;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -82,6 +80,7 @@ export default function ViralIdeasPage() {
   const [detectResult, setDetectResult] = useState<any>(null);
   const [scanningMain, setScanningMain] = useState(false);
   const [scanResult, setScanResult] = useState<any>(null);
+  const [scanProgress, setScanProgress] = useState<ScanJobStatus | null>(null);
   const [refreshingThumbnails, setRefreshingThumbnails] = useState(false);
   const [refreshResult, setRefreshResult] = useState<string | null>(null);
   const [creatingScriptId, setCreatingScriptId] = useState<string | null>(null);
@@ -127,133 +126,77 @@ export default function ViralIdeasPage() {
 
   /**
    * Capture the state of viral ideas and videos before a scan starts, so we
-   * can verify the real outcome if the request times out client-side.
-   * dateDetected is the timestamp written when a new viral idea is created;
-   * dateAdded is written when a new video is scraped (mid-scan, before
-   * viral detection runs).
+   * can show real progress instead of a spinner with no information.
    */
-  const captureScanBaseline = async (): Promise<ScanBaseline | null> => {
-    try {
-      const [ideasRes, videosRes] = await Promise.all([
-        fetch("/api/viral-ideas"),
-        fetch("/api/videos"),
-      ]);
-      if (!ideasRes.ok || !videosRes.ok) return null;
-      const ideas = (await ideasRes.json()) as ViralIdea[];
-      const videos = (await videosRes.json()) as { dateAdded?: string }[];
-      let ideaMain = 0;
-      let ideaMaxDate: string | null = null;
-      for (const idea of ideas) {
-        if (mainCompetitorUsernames.has(idea.creator)) ideaMain++;
-        if (idea.dateDetected && (!ideaMaxDate || idea.dateDetected > ideaMaxDate)) {
-          ideaMaxDate = idea.dateDetected;
-        }
-      }
-      let videoMaxDate: string | null = null;
-      for (const video of videos) {
-        if (video.dateAdded && (!videoMaxDate || video.dateAdded > videoMaxDate)) {
-          videoMaxDate = video.dateAdded;
-        }
-      }
-      return { ideaTotal: ideas.length, ideaMain, ideaMaxDate, videoTotal: videos.length, videoMaxDate };
-    } catch {
-      return null;
-    }
-  };
-
-  /**
-   * After a client-side timeout/failure, poll until the scan's real output
-   * lands (or the verification window expires) instead of guessing.
-   * Returns the number of new viral ideas found, or null if nothing changed.
-   */
-  const verifyScanOutcome = async (before: ScanBaseline) => {
-    await sleep(5000); // give the backend a few seconds before the first check
-    const deadline = Date.now() + 10 * 60 * 1000; // scan may still be running — keep checking for 10 minutes
-    let sawVideoActivity = false;
+  const pollScanJob = async (jobId: string): Promise<ScanJobStatus | null> => {
+    const deadline = Date.now() + 15 * 60 * 1000; // scans can legitimately run long — keep polling up to 15 minutes
     while (Date.now() < deadline) {
-      const after = await captureScanBaseline();
-      if (after) {
-        const newIdeas = after.ideaTotal > before.ideaTotal || after.ideaMain > before.ideaMain;
-        const newerIdeaTimestamps = !!after.ideaMaxDate && after.ideaMaxDate > (before.ideaMaxDate ?? "");
-        if (newIdeas || newerIdeaTimestamps) {
-          // Viral ideas landed — report success with the real count.
-          const mainDelta = Math.max(0, after.ideaMain - before.ideaMain);
-          const totalDelta = Math.max(0, after.ideaTotal - before.ideaTotal);
-          return { newCount: mainDelta > 0 ? mainDelta : totalDelta };
+      try {
+        const res = await fetch(`/api/viral-ideas/scan-status/${jobId}`);
+        if (res.ok) {
+          const job = (await res.json()) as ScanJobStatus;
+          setScanProgress(job);
+          if (job.status === "done" || job.status === "failed") {
+            return job;
+          }
         }
-        const newVideos = after.videoTotal > before.videoTotal;
-        const newerVideoTimestamps = !!after.videoMaxDate && after.videoMaxDate > (before.videoMaxDate ?? "");
-        if (newVideos || newerVideoTimestamps) {
-          // Videos are being scraped — the scan is running, keep waiting for ideas to land.
-          sawVideoActivity = true;
-        }
+      } catch {
+        // transient network hiccup while polling — just try again next tick
       }
-      await sleep(15000);
+      await sleep(3000);
     }
-    if (sawVideoActivity) {
-      // The scan ran (new videos were scraped) but produced no new viral ideas.
-      return { newCount: 0 };
-    }
-    return null; // nothing changed — genuinely may not have completed
+    return null; // gave up waiting — scan may still be running server-side
   };
 
   const handleScanMainCompetitors = async () => {
     setScanningMain(true);
     setScanResult(null);
+    setScanProgress(null);
 
-    // 1. Capture the current state BEFORE starting the scan
-    const before = await captureScanBaseline();
-
-    let data: unknown = null;
+    // The route responds immediately with a jobId (202) — the actual
+    // scrape+analyze+script work keeps running server-side afterward, so
+    // this request can never hit the Cloudflare gateway timeout itself.
+    let jobId: string | null = null;
     try {
       const response = await fetch("/api/viral-ideas/scan-main-competitors", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({}),
       });
-      try {
-        data = await response.json();
-      } catch {
-        data = null; // proxy timeout pages (524/504) have no JSON body
-      }
+      const data = await response.json().catch(() => null);
+      jobId = data?.jobId ?? null;
     } catch {
-      // Network failure / client-side timeout — the backend may still be running.
-      // Do NOT report failure yet; verify the actual outcome below.
-      data = null;
+      jobId = null;
     }
 
-    if (isScanResult(data) && data.success) {
-      setScanResult(data);
-      loadIdeas();
-      setFilterTab("main"); // Auto-switch to main competitors tab
+    if (!jobId) {
+      setScanResult({ success: false, error: "Could not start the scan — no job was created. Check your connection and try again." });
       setScanningMain(false);
       return;
     }
 
-    if (isScanResult(data)) {
-      // Definitive backend answer (e.g. no main competitors configured)
-      setScanResult(data);
-      setScanningMain(false);
-      return;
-    }
+    const job = await pollScanJob(jobId);
+    setScanProgress(null);
 
-    // 2. Request failed or timed out client-side — verify the real outcome
-    const verified = before ? await verifyScanOutcome(before) : null;
-    if (verified) {
-      setScanResult({
-        success: true,
-        message: verified.newCount > 0
-          ? `Scan completed in the background — found ${verified.newCount} new viral ideas`
-          : "Scan completed — no new viral ideas found",
-      });
-      loadIdeas();
-      setFilterTab("main"); // Auto-switch to main competitors tab
-    } else {
+    if (!job) {
       setScanResult({
         success: false,
-        error: "Failed to scan main competitors — no new viral ideas or videos appeared after waiting. The scan may still be running in the background; refresh in a few minutes.",
+        error: "Still scanning after 15 minutes of waiting — it may still finish in the background. Refresh the page in a few minutes to check.",
       });
+      setScanningMain(false);
+      return;
     }
+
+    if (job.status === "failed") {
+      setScanResult({ success: false, error: job.error || "Scan failed for an unknown reason." });
+      setScanningMain(false);
+      return;
+    }
+
+    // job.status === "done"
+    setScanResult(job.result || { success: true, message: "Scan completed." });
+    loadIdeas();
+    setFilterTab("main"); // Auto-switch to main competitors tab
     setScanningMain(false);
   };
 
@@ -376,7 +319,12 @@ export default function ViralIdeasPage() {
             className="bg-gradient-to-r from-red-600 to-orange-600 hover:from-red-700 hover:to-orange-700 text-white border border-red-400/30"
           >
             {scanningMain ? (
-              <><Zap className="w-4 h-4 mr-2 animate-pulse" />Scanning... this may take a few minutes</>
+              <>
+                <Zap className="w-4 h-4 mr-2 animate-pulse" />
+                {scanProgress?.progressStep
+                  ? `${scanProgress.progressStep}${scanProgress.progressTotal ? ` (${scanProgress.progressCurrent}/${scanProgress.progressTotal})` : ""}`
+                  : "Starting scan..."}
+              </>
             ) : (
               <><Flame className="w-4 h-4 mr-2" />Scan Main Competitors</>
             )}

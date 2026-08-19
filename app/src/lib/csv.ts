@@ -110,6 +110,17 @@ export function appendVideo(video: Video, workspaceId = DEFAULT_WORKSPACE): void
   ins.run(video.id, workspaceId, video.link, video.thumbnail, video.creator, video.views, video.likes, video.comments, video.analysis, video.newConcepts, video.datePosted, video.dateAdded, video.configName, video.starred ? 1 : 0);
 }
 
+/**
+ * Patch just the `analysis` field for a single video, in place.
+ * Used after scraping, once the original-video AI analysis (hook/body/CTA
+ * source material) comes back — avoids a full readVideos()/writeVideos()
+ * round trip for every video in a scan.
+ */
+export function updateVideoAnalysis(videoId: string, analysis: string, workspaceId = DEFAULT_WORKSPACE): void {
+  const db = getDb();
+  db.prepare("UPDATE videos SET analysis = ? WHERE id = ? AND workspace_id = ?").run(analysis, videoId, workspaceId);
+}
+
 // ─────────────────────── Strategies ───────────────────────
 
 export function readStrategies(workspaceId?: string): Strategy[] {

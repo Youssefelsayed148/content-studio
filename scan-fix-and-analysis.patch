@@ -1,0 +1,1232 @@
+From 7a18810c32157a69dd7a5d3e24c7ceeeb6468676 Mon Sep 17 00:00:00 2001
+From: Sandbox Agent <agent@sandbox.local>
+Date: Wed, 19 Aug 2026 22:09:50 +0000
+Subject: [PATCH] Fix 524 scan timeout via background job + polling; wire real
+ original-video analysis into scan-main-competitors
+
+- New scan_jobs table + lib/scan-jobs.ts: tracks background job status/
+  progress. scan-main-competitors/route.ts now returns 202 { jobId }
+  immediately instead of blocking for the full scrape+analyze+script
+  duration, which previously exceeded Cloudflare's ~100s gateway timeout
+  on any scan with more than one or two main competitors (524 error),
+  even though the backend kept working and completed successfully anyway.
+- New GET /api/viral-ideas/scan-status/[jobId] endpoint for polling.
+- Frontend (viral-ideas/page.tsx): replaced the old DB-diffing heuristic
+  with real job-status polling every 3s, showing live progress in the
+  button label.
+- New lib/video-analysis.ts: analyzeOriginalVideo() - real Gemini video
+  analysis when GEMINI_API_KEY is configured, with a text-based
+  inference fallback via opencode-go when Gemini isn't available.
+- scan-main-competitors/route.ts now calls analyzeOriginalVideo() for
+  each newly scraped video and saves via new csv.ts helper
+  updateVideoAnalysis() - this is what previously stayed hardcoded as
+  analysis: "" forever, causing the Original tab, Side-by-Side, and
+  hook/body/CTA extraction to always show placeholder text.
+
+Requires GEMINI_API_KEY in .env for real video analysis (free tier
+works - Flash/Flash-Lite support video understanding at no cost).
+Without it, videos still get analysis via the text-fallback path.
+---
+ .../scan-main-competitors/route.ts            | 587 ++++++++++--------
+ .../viral-ideas/scan-status/[jobId]/route.ts  |  14 +
+ app/src/app/viral-ideas/page.tsx              | 168 ++---
+ app/src/lib/csv.ts                            |  11 +
+ app/src/lib/db.ts                             |  19 +
+ app/src/lib/scan-jobs.ts                      |  95 +++
+ app/src/lib/video-analysis.ts                 |  78 +++
+ 7 files changed, 598 insertions(+), 374 deletions(-)
+ create mode 100644 app/src/app/api/viral-ideas/scan-status/[jobId]/route.ts
+ create mode 100644 app/src/lib/scan-jobs.ts
+ create mode 100644 app/src/lib/video-analysis.ts
+
+diff --git a/app/src/app/api/viral-ideas/scan-main-competitors/route.ts b/app/src/app/api/viral-ideas/scan-main-competitors/route.ts
+index a06cfa8..07b1e59 100644
+--- a/app/src/app/api/viral-ideas/scan-main-competitors/route.ts
++++ b/app/src/app/api/viral-ideas/scan-main-competitors/route.ts
+@@ -1,38 +1,79 @@
+ import { NextResponse } from "next/server";
+-import { readVideos, readCreators, readViralIdeas, writeViralIdeas, appendVideo, readConfigs, readAiSettings } from "@/lib/csv";
++import { readVideos, readCreators, readViralIdeas, writeViralIdeas, appendVideo, updateVideoAnalysis, readConfigs, readAiSettings } from "@/lib/csv";
+ import { scrapeReels, scrapePostsByUrls } from "@/lib/apify";
+ import { downloadThumbnail, getLocalThumbnailPath } from "@/lib/thumbnail-cache";
+ import { detectViralVideos } from "@/lib/viral-detector";
+ import { getProviderForTask } from "@/lib/ai-providers/factory";
++import { analyzeOriginalVideo, defaultAnalysisInstruction } from "@/lib/video-analysis";
++import { createScanJob, updateScanJobProgress, completeScanJob, failScanJob, getScanJob } from "@/lib/scan-jobs";
+ import { v4 as uuid } from "uuid";
+ import type { ViralIdea, Video, Config } from "@/lib/types";
++import type { AIUserSettings } from "@/lib/ai-providers/types";
+ 
+ const MAIN_COMPETITOR_LOOKBACK_DAYS = 120;
+ const VIRAL_THRESHOLD = 1.2;
+ 
+ // Bounds on AI script generation per scan. Each generation is a full AI
+-// round-trip, so these keep total wall time well under the Cloudflare/proxy
+-// request timeout. Ideas beyond the cap are saved with a "not generated yet"
+-// placeholder rather than a fabricated error.
++// round-trip; kept bounded so a single scan can't run indefinitely even
++// though it's no longer constrained by the HTTP request lifetime.
+ const MAX_SCRIPT_GENERATIONS_PER_SCAN = 8;
+ const SCRIPT_GENERATION_CONCURRENCY = 3;
+ 
++// Same bounding logic for original-video analysis (the Gemini/text-fallback
++// call that powers the Original tab, Side-by-Side, and hook/body/CTA).
++const MAX_VIDEO_ANALYSES_PER_SCAN = 15;
++const VIDEO_ANALYSIS_CONCURRENCY = 3;
++
+ /**
+  * Dedicated endpoint for scanning main competitors.
+- * 
+- * Flow:
++ *
++ * Runs as a background job instead of one long synchronous request, because
++ * scraping (46-65s per competitor on Apify's current free-plan speed) plus
++ * AI analysis/script generation for several competitors easily exceeds
++ * Cloudflare's ~100s gateway timeout. This route creates a job row and
++ * returns `202 { jobId }` immediately; the actual work keeps running
++ * server-side (this is a persistent `next start` Node process, not a
++ * serverless function that freezes on response) and updates the job row as
++ * it progresses. The frontend polls GET /scan-status/:jobId instead of
++ * holding one request open, so it can never hit the same timeout itself.
++ *
++ * Flow (same as before, just no longer blocking the HTTP response):
+  * 1. Identify main competitors from creators.csv
+- * 2. Try to scrape each main competitor for past 120 days (sequential to avoid API limits)
+- * 3. Run viral detection on ALL videos from main competitors (new + existing)
+- * 4. Save new viral ideas to viral_ideas.csv
+- * 5. ALWAYS returns output — if scraping fails, detects virals from existing data
++ * 2. Scrape each main competitor for past 120 days (sequential, API limits)
++ * 3. Analyze each new video's original content (Gemini video analysis, or
++ *    text-based inference from caption/hashtags if Gemini isn't configured)
++ * 4. Run viral detection on ALL videos from main competitors (new + existing)
++ * 5. Save new viral ideas, generate brand-adapted scripts for the top ones
+  */
+ export async function POST(request: Request) {
++  let configName: string | undefined;
++  try {
++    const body = await request.json().catch(() => ({}));
++    configName = body?.configName;
++  } catch {
++    // no body — fine, configName stays undefined and we fall back to the first config
++  }
++
++  const jobId = createScanJob(configName);
++
++  // Deliberately not awaited — this keeps running after the response below
++  // is sent. Errors inside are caught and written to the job row itself,
++  // never left to become an unhandled rejection.
++  runScan(jobId, configName).catch((err) => {
++    failScanJob(jobId, err instanceof Error ? err.message : String(err));
++  });
++
++  return NextResponse.json({ jobId }, { status: 202 });
++}
++
++async function runScan(jobId: string, configName: string | undefined) {
+   const results = {
+     success: true,
+     mainCompetitors: [] as string[],
+     scraped: [] as { username: string; videosFound: number; error?: string }[],
+     newVideosSaved: 0,
++    videosAnalyzed: 0,
++    videosAnalysisFailed: 0,
+     viralDetected: 0,
+     newViralIdeas: 0,
+     scriptsGenerated: 0,
+@@ -41,260 +82,299 @@ export async function POST(request: Request) {
+     fallbackUsed: false,
+   };
+ 
+-  try {
+-    const body = await request.json();
+-    const configName = body.configName;
+-
+-    // 1. Identify main competitors
+-    const allCreators = readCreators();
+-    const mainCompetitors = allCreators.filter((c) => c.isMainCompetitor);
+-    results.mainCompetitors = mainCompetitors.map((c) => c.username);
+-
+-    if (mainCompetitors.length === 0) {
+-      return NextResponse.json({
+-        ...results,
+-        success: false,
+-        error: "No main competitors set. Go to Competitors page and mark your key competitors as 'Main Competitors'.",
+-      }, { status: 400 });
+-    }
++  const allCreators = readCreators();
++  const mainCompetitors = allCreators.filter((c) => c.isMainCompetitor);
++  results.mainCompetitors = mainCompetitors.map((c) => c.username);
++
++  if (mainCompetitors.length === 0) {
++    completeScanJob(jobId, {
++      ...results,
++      success: false,
++      error: "No main competitors set. Go to Competitors page and mark your key competitors as 'Main Competitors'.",
++    });
++    return;
++  }
++
++  const configs = readConfigs();
++  const config = configName
++    ? configs.find((c) => c.configName === configName)
++    : configs[0];
++  const saveConfigName = config?.configName || "default";
++  const aiSettings = readAiSettings() || undefined;
++
++  updateScanJobProgress(jobId, { step: "Scraping competitor videos...", total: mainCompetitors.length });
++  const allVideos = readVideos();
++  const existingLinks = new Set(allVideos.map((v) => v.link));
++  const newVideos: (Video & { _videoUrl?: string; _caption?: string; _hashtags?: string[] })[] = [];
++
++  let competitorIndex = 0;
++  for (const competitor of mainCompetitors) {
++    competitorIndex++;
++    updateScanJobProgress(jobId, {
++      step: `Scraping @${competitor.username} (${competitorIndex}/${mainCompetitors.length})...`,
++      current: competitorIndex,
++    });
++    try {
++      const reels = await scrapeReels(competitor.username, 50, MAIN_COMPETITOR_LOOKBACK_DAYS);
++
++      const cutoffDate = new Date(Date.now() - MAIN_COMPETITOR_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
++      const videos = reels
++        .filter((r) => r.videoUrl && r.timestamp && !existingLinks.has(r.url))
++        .map((r) => ({
++          videoUrl: r.videoUrl,
++          postUrl: r.url,
++          views: r.videoPlayCount || 0,
++          likes: r.likesCount || 0,
++          comments: r.commentsCount || 0,
++          username: r.ownerUsername || competitor.username,
++          thumbnail: r.images?.[0] || "",
++          caption: r.caption || "",
++          hashtags: r.hashtags || [],
++          datePosted: r.timestamp?.split("T")[0] || "",
++          timestamp: new Date(r.timestamp),
++        }))
++        .filter((v) => v.timestamp >= cutoffDate);
++
++      for (const v of videos) {
++        const video: Video & { _videoUrl?: string; _caption?: string; _hashtags?: string[] } = {
++          id: uuid(),
++          link: v.postUrl,
++          thumbnail: v.thumbnail,
++          creator: v.username,
++          views: v.views,
++          likes: v.likes,
++          comments: v.comments,
++          analysis: "", // filled in below, in the analysis phase
++          newConcepts: "",
++          datePosted: v.datePosted,
++          dateAdded: new Date().toISOString(),
++          configName: saveConfigName,
++          starred: false,
++        };
++        appendVideo(video);
++        // Carry scrape-only fields for the analysis phase — not part of the
++        // persisted Video schema, just kept in memory for this run.
++        video._videoUrl = v.videoUrl;
++        video._caption = v.caption;
++        video._hashtags = v.hashtags;
++        newVideos.push(video);
++        existingLinks.add(v.postUrl);
++      }
+ 
+-    // Get config for saving videos
+-    const configs = readConfigs();
+-    const config = configName 
+-      ? configs.find((c) => c.configName === configName) 
+-      : configs[0];
+-    const saveConfigName = config?.configName || "default";
++      results.scraped.push({ username: competitor.username, videosFound: videos.length });
++      results.newVideosSaved += videos.length;
++    } catch (err) {
++      const msg = err instanceof Error ? err.message : String(err);
++      results.scraped.push({ username: competitor.username, videosFound: 0, error: msg });
++      results.errors.push(`@${competitor.username}: ${msg}`);
++    }
++  }
+ 
+-    // 2. Try to scrape main competitors (sequential to respect API limits)
+-    const allVideos = readVideos();
+-    const existingLinks = new Set(allVideos.map((v) => v.link));
+-    let newVideos: Video[] = [];
++  if (results.scraped.every((s) => s.error)) {
++    results.fallbackUsed = true;
++  }
+ 
+-    for (const competitor of mainCompetitors) {
++  updateScanJobProgress(jobId, { step: "Caching thumbnails..." });
++  await Promise.allSettled(newVideos.map((v) => downloadThumbnail(v.thumbnail, v.id, v.link)));
++  const missingThumbnails = newVideos.filter((v) => !getLocalThumbnailPath(v.id));
++  if (missingThumbnails.length > 0) {
++    for (let i = 0; i < missingThumbnails.length; i += 10) {
++      const batch = missingThumbnails.slice(i, i + 10);
+       try {
+-        const reels = await scrapeReels(competitor.username, 50, MAIN_COMPETITOR_LOOKBACK_DAYS);
+-        
+-        const cutoffDate = new Date(Date.now() - MAIN_COMPETITOR_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
+-        const videos = reels
+-          .filter((r) => r.videoUrl && r.timestamp && !existingLinks.has(r.url))
+-          .map((r) => ({
+-            videoUrl: r.videoUrl,
+-            postUrl: r.url,
+-            views: r.videoPlayCount || 0,
+-            likes: r.likesCount || 0,
+-            comments: r.commentsCount || 0,
+-            username: r.ownerUsername || competitor.username,
+-            thumbnail: r.images?.[0] || "",
+-            datePosted: r.timestamp?.split("T")[0] || "",
+-            timestamp: new Date(r.timestamp),
+-          }))
+-          .filter((v) => v.timestamp >= cutoffDate);
+-
+-        // Save new videos (without analysis — just raw data for viral detection)
+-        for (const v of videos) {
+-          const video: Video = {
+-            id: uuid(),
+-            link: v.postUrl,
+-            thumbnail: v.thumbnail,
+-            creator: v.username,
+-            views: v.views,
+-            likes: v.likes,
+-            comments: v.comments,
+-            analysis: "", // No AI analysis yet — APIs are limited
+-            newConcepts: "",
+-            datePosted: v.datePosted,
+-            dateAdded: new Date().toISOString(),
+-            configName: saveConfigName,
+-            starred: false,
+-          };
+-          appendVideo(video);
+-          newVideos.push(video);
+-          existingLinks.add(v.postUrl);
++        const posts = await scrapePostsByUrls(batch.map((v) => v.link));
++        for (const post of posts) {
++          const video = batch.find((v) => v.link === post.url);
++          if (!video) continue;
++          const thumbUrl = post.displayUrl || post.images?.[0];
++          if (thumbUrl) await downloadThumbnail(thumbUrl, video.id, video.link);
+         }
+-
+-        results.scraped.push({
+-          username: competitor.username,
+-          videosFound: videos.length,
+-        });
+-        results.newVideosSaved += videos.length;
+-      } catch (err) {
+-        const msg = err instanceof Error ? err.message : String(err);
+-        results.scraped.push({
+-          username: competitor.username,
+-          videosFound: 0,
+-          error: msg,
+-        });
+-        results.errors.push(`@${competitor.username}: ${msg}`);
++      } catch {
++        // Best-effort — a failed re-scrape must not fail the scan.
+       }
+     }
++  }
+ 
+-    // If ALL scrapes failed, mark fallback
+-    if (results.scraped.every((s) => s.error)) {
+-      results.fallbackUsed = true;
+-    }
+-
+-    // Cache a thumbnail for every new video. Profile-feed scrapes frequently
+-    // omit image fields (empty displayUrl/images), so after trying the scraped
+-    // URL directly we re-scrape the post URLs in batches — post-level scrapes
+-    // do include fresh CDN image URLs.
+-    await Promise.allSettled(
+-      newVideos.map((v) => downloadThumbnail(v.thumbnail, v.id, v.link))
+-    );
+-    const missingThumbnails = newVideos.filter((v) => !getLocalThumbnailPath(v.id));
+-    if (missingThumbnails.length > 0) {
+-      for (let i = 0; i < missingThumbnails.length; i += 10) {
+-        const batch = missingThumbnails.slice(i, i + 10);
++  // Analyze original videos — Gemini native video analysis if configured,
++  // otherwise text-based inference from caption/hashtags. This is what
++  // populates the Original tab, Side-by-Side competitor column, and
++  // hook/body/CTA extraction, all of which previously stayed permanently
++  // empty because this step never ran at all.
++  const analysisInstruction = defaultAnalysisInstruction(config);
++  const analysisTargets = newVideos.slice(0, MAX_VIDEO_ANALYSES_PER_SCAN);
++  updateScanJobProgress(jobId, { step: "Analyzing original videos...", total: analysisTargets.length, current: 0 });
++
++  let analyzedCount = 0;
++  for (let i = 0; i < analysisTargets.length; i += VIDEO_ANALYSIS_CONCURRENCY) {
++    const batch = analysisTargets.slice(i, i + VIDEO_ANALYSIS_CONCURRENCY);
++    await Promise.all(
++      batch.map(async (v) => {
+         try {
+-          const posts = await scrapePostsByUrls(batch.map((v) => v.link));
+-          for (const post of posts) {
+-            const video = batch.find((v) => v.link === post.url);
+-            if (!video) continue;
+-            const thumbUrl = post.displayUrl || post.images?.[0];
+-            if (thumbUrl) {
+-              await downloadThumbnail(thumbUrl, video.id, video.link);
+-            }
++          const analysis = await analyzeOriginalVideo(
++            {
++              videoUrl: v._videoUrl,
++              caption: v._caption,
++              hashtags: v._hashtags,
++              views: v.views,
++              likes: v.likes,
++              comments: v.comments,
++              username: v.creator,
++            },
++            analysisInstruction,
++            aiSettings
++          );
++          if (analysis) {
++            updateVideoAnalysis(v.id, analysis);
++            v.analysis = analysis; // keep in-memory copy in sync for the detection step below
++            results.videosAnalyzed++;
++          } else {
++            results.videosAnalysisFailed++;
+           }
+         } catch {
+-          // Best-effort — a failed re-scrape must not fail the scan.
++          results.videosAnalysisFailed++;
+         }
+-      }
+-    }
++        analyzedCount++;
++        updateScanJobProgress(jobId, { current: analyzedCount });
++      })
++    );
++  }
+ 
+-    // 3. Run viral detection on ALL videos from main competitors (existing + new)
+-    const refreshedVideos = readVideos();
+-    const mainCompetitorUsernames = new Set(mainCompetitors.map((c) => c.username));
+-    const competitorVideos = refreshedVideos.filter((v) => mainCompetitorUsernames.has(v.creator));
+-
+-    const detectionResults = detectViralVideos(competitorVideos, allCreators, refreshedVideos, VIRAL_THRESHOLD);
+-    const viralResults = detectionResults.filter((r) => r.isViral);
+-    results.viralDetected = viralResults.length;
+-
+-    // 4. Save new viral ideas
+-    const existingViralIds = new Set(readViralIdeas().map((v) => v.videoId));
+-    const newViralIdeas: ViralIdea[] = [];
+-
+-    for (const result of viralResults) {
+-      const video = result.video;
+-      if (existingViralIds.has(video.id)) continue;
+-
+-      const originalParts = extractOriginalScript(video.analysis);
+-      const sevenBricksAnalysis = generateSevenBricksFromVideo(video, result);
+-
+-      const viralIdea: ViralIdea = {
+-        id: uuid(),
+-        videoId: video.id,
+-        creator: video.creator,
+-        link: video.link,
+-        thumbnail: video.thumbnail,
+-        views: video.views,
+-        likes: video.likes,
+-        comments: video.comments,
+-        creatorAvgViews: result.creatorAvgViews,
+-        viralMultiplier: result.viralMultiplier,
+-        originalScript: video.analysis || `Video from @${video.creator} — ${video.views.toLocaleString()} views. No AI analysis available for this video yet.`,
+-        originalHook: originalParts.hook || "No hook extracted",
+-        originalBody: originalParts.body || "No body extracted",
+-        originalCTA: originalParts.cta || "No CTA extracted",
+-        // Populated below in the bounded script-generation phase. Anything not
+-        // reached this run stays honestly labelled as pending rather than being
+-        // dressed up as a quota error.
+-        adaptedScript: "Script not generated yet — re-run the scan or generate from the Scripts view.",
+-        adaptedHook: "",
+-        adaptedBody: "",
+-        adaptedCTA: "",
+-        sevenBricksAnalysis,
+-        contentPillar: extractContentPillar(video.analysis),
+-        status: "detected",
+-        configName: saveConfigName,
+-        platform: "tiktok",
+-        dateDetected: new Date().toISOString(),
+-        dateAnalyzed: new Date().toISOString(),
+-        dateScripted: new Date().toISOString(),
+-        laraNotes: "",
+-        hanaNotes: "",
+-      };
+-
+-      newViralIdeas.push(viralIdea);
+-    }
++  updateScanJobProgress(jobId, { step: "Running viral detection..." });
++  const refreshedVideos = readVideos();
++  const mainCompetitorUsernames = new Set(mainCompetitors.map((c) => c.username));
++  const competitorVideos = refreshedVideos.filter((v) => mainCompetitorUsernames.has(v.creator));
++
++  const detectionResults = detectViralVideos(competitorVideos, allCreators, refreshedVideos, VIRAL_THRESHOLD);
++  const viralResults = detectionResults.filter((r) => r.isViral);
++  results.viralDetected = viralResults.length;
++
++  const existingViralIds = new Set(readViralIdeas().map((v) => v.videoId));
++  const newViralIdeas: ViralIdea[] = [];
++
++  for (const result of viralResults) {
++    const video = result.video;
++    if (existingViralIds.has(video.id)) continue;
++
++    const originalParts = extractOriginalScript(video.analysis);
++    const sevenBricksAnalysis = generateSevenBricksFromVideo(video, result);
++
++    const viralIdea: ViralIdea = {
++      id: uuid(),
++      videoId: video.id,
++      creator: video.creator,
++      link: video.link,
++      thumbnail: video.thumbnail,
++      views: video.views,
++      likes: video.likes,
++      comments: video.comments,
++      creatorAvgViews: result.creatorAvgViews,
++      viralMultiplier: result.viralMultiplier,
++      originalScript: video.analysis || `Video from @${video.creator} — ${video.views.toLocaleString()} views. No AI analysis available for this video yet.`,
++      originalHook: originalParts.hook || "No hook extracted",
++      originalBody: originalParts.body || "No body extracted",
++      originalCTA: originalParts.cta || "No CTA extracted",
++      adaptedScript: "Script not generated yet — re-run the scan or generate from the Scripts view.",
++      adaptedHook: "",
++      adaptedBody: "",
++      adaptedCTA: "",
++      sevenBricksAnalysis,
++      contentPillar: extractContentPillar(video.analysis),
++      status: "detected",
++      configName: saveConfigName,
++      platform: "tiktok",
++      dateDetected: new Date().toISOString(),
++      dateAnalyzed: new Date().toISOString(),
++      dateScripted: new Date().toISOString(),
++      laraNotes: "",
++      hanaNotes: "",
++    };
+ 
+-    // Generate adapted scripts for the strongest new ideas only.
+-    //
+-    // Each generation is a full AI round-trip (~20-40s on glm-5.2), so this is
+-    // deliberately bounded on two axes: MAX_SCRIPT_GENERATIONS_PER_SCAN caps the
+-    // total, and SCRIPT_GENERATION_CONCURRENCY caps how many run at once. Without
+-    // both, a scan detecting dozens of new videos would run serial AI calls for
+-    // many minutes and blow the Cloudflare request timeout. Ideas beyond the cap
+-    // are still saved — they just keep the honest "not generated yet" placeholder.
+-    const scriptTargets = [...newViralIdeas]
+-      .sort((a, b) => b.viralMultiplier - a.viralMultiplier)
+-      .slice(0, MAX_SCRIPT_GENERATIONS_PER_SCAN);
+-
+-    let scriptsGenerated = 0;
+-    let scriptsFailed = 0;
+-
+-    for (let i = 0; i < scriptTargets.length; i += SCRIPT_GENERATION_CONCURRENCY) {
+-      const batch = scriptTargets.slice(i, i + SCRIPT_GENERATION_CONCURRENCY);
+-      await Promise.all(
+-        batch.map(async (idea) => {
+-          const generated = await generateAdaptedScript(idea, config);
+-          if (generated.ok) {
+-            const parts = extractAdaptedScript(generated.text);
+-            idea.adaptedScript = generated.text;
+-            idea.adaptedHook = parts.hook;
+-            idea.adaptedBody = parts.body;
+-            idea.adaptedCTA = parts.cta;
+-            idea.dateScripted = new Date().toISOString();
+-            scriptsGenerated++;
+-          } else {
+-            idea.adaptedScript = `Script generation failed: ${generated.error}`;
+-            scriptsFailed++;
+-          }
+-        })
+-      );
+-    }
++    newViralIdeas.push(viralIdea);
++  }
+ 
+-    results.scriptsGenerated = scriptsGenerated;
+-    results.scriptsFailed = scriptsFailed;
++  updateScanJobProgress(jobId, {
++    step: "Generating adapted scripts...",
++    total: Math.min(newViralIdeas.length, MAX_SCRIPT_GENERATIONS_PER_SCAN),
++    current: 0,
++  });
++  const scriptTargets = [...newViralIdeas]
++    .sort((a, b) => b.viralMultiplier - a.viralMultiplier)
++    .slice(0, MAX_SCRIPT_GENERATIONS_PER_SCAN);
++
++  let scriptsGenerated = 0;
++  let scriptsFailed = 0;
++  let scriptedCount = 0;
++
++  for (let i = 0; i < scriptTargets.length; i += SCRIPT_GENERATION_CONCURRENCY) {
++    const batch = scriptTargets.slice(i, i + SCRIPT_GENERATION_CONCURRENCY);
++    await Promise.all(
++      batch.map(async (idea) => {
++        const generated = await generateAdaptedScript(idea, config, aiSettings);
++        if (generated.ok) {
++          const parts = extractAdaptedScript(generated.text);
++          idea.adaptedScript = generated.text;
++          idea.adaptedHook = parts.hook;
++          idea.adaptedBody = parts.body;
++          idea.adaptedCTA = parts.cta;
++          idea.dateScripted = new Date().toISOString();
++          scriptsGenerated++;
++        } else {
++          idea.adaptedScript = `Script generation failed: ${generated.error}`;
++          scriptsFailed++;
++        }
++        scriptedCount++;
++        updateScanJobProgress(jobId, { current: scriptedCount });
++      })
++    );
++  }
+ 
+-    if (newViralIdeas.length > 0) {
+-      const existing = readViralIdeas();
+-      writeViralIdeas([...existing, ...newViralIdeas]);
+-      results.newViralIdeas = newViralIdeas.length;
+-    }
++  results.scriptsGenerated = scriptsGenerated;
++  results.scriptsFailed = scriptsFailed;
+ 
+-    return NextResponse.json({
+-      ...results,
+-      message: results.fallbackUsed
+-        ? `API limits hit — used fallback on ${competitorVideos.length} existing videos from main competitors. Found ${results.newViralIdeas} new viral ideas.`
+-        : `Scanned ${results.mainCompetitors.length} main competitors. Found ${results.newVideosSaved} new videos and ${results.newViralIdeas} new viral ideas.`,
+-    });
++  if (newViralIdeas.length > 0) {
++    const existing = readViralIdeas();
++    writeViralIdeas([...existing, ...newViralIdeas]);
++    results.newViralIdeas = newViralIdeas.length;
++  }
+ 
+-  } catch (err) {
+-    return NextResponse.json(
+-      {
+-        ...results,
+-        success: false,
+-        error: err instanceof Error ? err.message : "Unknown error",
+-      },
+-      { status: 500 }
+-    );
++  completeScanJob(jobId, {
++    ...results,
++    message: results.fallbackUsed
++      ? `API limits hit — used fallback on ${competitorVideos.length} existing videos from main competitors. Found ${results.newViralIdeas} new viral ideas.`
++      : `Scanned ${results.mainCompetitors.length} main competitors. Found ${results.newVideosSaved} new videos, analyzed ${results.videosAnalyzed} originals, and found ${results.newViralIdeas} new viral ideas.`,
++  });
++}
++
++/**
++ * Convenience GET on this same route (?jobId=...) mirroring the dedicated
++ * /scan-status/:jobId endpoint, so any existing client code hitting this
++ * URL for status doesn't hard-fail.
++ */
++export async function GET(request: Request) {
++  const { searchParams } = new URL(request.url);
++  const jobId = searchParams.get("jobId");
++  if (!jobId) {
++    return NextResponse.json({ error: "jobId query param required" }, { status: 400 });
++  }
++  const job = getScanJob(jobId);
++  if (!job) {
++    return NextResponse.json({ error: "Job not found" }, { status: 404 });
+   }
++  return NextResponse.json(job);
+ }
+ 
+ /**
+  * Generate the brand-adapted script via the configured AI provider
+  * (opencode-go / glm-5.2 by default — see DEFAULT_AI_SETTINGS in ai-providers/types.ts).
+- * Mirrors the pattern used in lib/process-viral.ts's runBrandScriptGeneration.
+  * Returns an honest ok/error result rather than masking failures behind a
+  * fabricated "quota exceeded" message.
+  */
+ async function generateAdaptedScript(
+   idea: ViralIdea,
+-  config: Config | undefined
++  config: Config | undefined,
++  aiSettings: AIUserSettings | undefined
+ ): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
+   try {
+-    const aiSettings = readAiSettings();
+-    const scriptProvider = await getProviderForTask("script-generation", aiSettings || undefined);
++    const scriptProvider = await getProviderForTask("script-generation", aiSettings);
+ 
+     const viralContext = `
+ ---
+@@ -345,10 +425,10 @@ Format the output with "## HOOK", "## BODY", and "## CTA" section headers.`;
+ 
+ function extractOriginalScript(analysis: string): { hook: string; body: string; cta: string } {
+   if (!analysis) return { hook: "", body: "", cta: "" };
+-  
++
+   const hookMatch = analysis.match(/\*\*HOOK:\*\*[\s\S]*?(?=\*\*RETENTION|\*\*SCRIPT|$)/i);
+   const scriptMatch = analysis.match(/\*\*SCRIPT:\*\*[\s\S]*?(?=$)/i);
+-  
++
+   if (hookMatch && scriptMatch) {
+     const fullScript = scriptMatch[0];
+     const lines = fullScript.split('\n').filter(l => l.trim());
+@@ -357,7 +437,7 @@ function extractOriginalScript(analysis: string): { hook: string; body: string;
+     const cta = lines.slice(-2).join('\n');
+     return { hook, body, cta };
+   }
+-  
++
+   const paragraphs = analysis.split('\n\n').filter(p => p.trim());
+   if (paragraphs.length >= 3) {
+     return {
+@@ -366,17 +446,17 @@ function extractOriginalScript(analysis: string): { hook: string; body: string;
+       cta: paragraphs[paragraphs.length - 1],
+     };
+   }
+-  
++
+   return { hook: analysis.slice(0, 300), body: analysis.slice(300, 1000), cta: analysis.slice(1000) };
+ }
+ 
+ function extractAdaptedScript(newConcepts: string): { hook: string; body: string; cta: string } {
+   if (!newConcepts) return { hook: "", body: "", cta: "" };
+-  
++
+   const hookMatch = newConcepts.match(/##\s*HOOK[\s\S]*?(?=##\s*(BODY|SCRIPT)|$)/i);
+   const bodyMatch = newConcepts.match(/##\s*(?:BODY|SCRIPT)[\s\S]*?(?=##\s*CTA|$)/i);
+   const ctaMatch = newConcepts.match(/##\s*CTA[\s\S]*?(?=##|$)/i);
+-  
++
+   return {
+     hook: hookMatch ? hookMatch[0] : newConcepts.slice(0, 500),
+     body: bodyMatch ? bodyMatch[0] : newConcepts.slice(500, 2000),
+@@ -398,33 +478,12 @@ function generateSevenBricksFromVideo(
+ 
+ ## Deep Deconstruction
+ 
+-### Brick 1: Topic
+-This video addresses a topic that resonated deeply with the audience, generating significantly above-average engagement.
+-
+-### Brick 2: Angle
+-The content presents a unique perspective or contrarian take that challenges conventional thinking.
+-
+-### Brick 3: Hook
+-Strong opening that stops the scroll through visual-text-audio alignment.
+-
+-### Brick 4: Story Structure
+-Follows a proven narrative format that builds tension and delivers payoff.
+-
+-### Brick 5: Visual Format
+-Production style matches platform expectations while adding distinctive visual elements.
+-
+-### Brick 6: Key Visuals
+-Specific visual elements help viewers understand complex ideas quickly.
+-
+-### Brick 7: Audio
+-Audio strategy supports the message through appropriate music, voiceover, or sound effects.
++${video.analysis ? `### Source Analysis\n${video.analysis}\n` : `*No original-video analysis available — falling back to performance-only context.*\n`}
+ 
+ ## Winning Bricks (Why This Went Viral)
+ 1. **Hook** — Stopped the scroll immediately
+-2. **Story Structure** — Kept viewers watching until the end  
+-3. **Angle** — Sparked comments and shares
+-
+-*Note: For deeper AI-powered analysis, run the full pipeline with Gemini + Claude API access.*`;
++2. **Story Structure** — Kept viewers watching until the end
++3. **Angle** — Sparked comments and shares`;
+ }
+ 
+ function extractContentPillar(analysis: string): string {
+@@ -449,4 +508,4 @@ function extractContentPillar(analysis: string): string {
+     return "Real Estate";
+   }
+   return "Investment Education";
+-}
+\ No newline at end of file
++}
+diff --git a/app/src/app/api/viral-ideas/scan-status/[jobId]/route.ts b/app/src/app/api/viral-ideas/scan-status/[jobId]/route.ts
+new file mode 100644
+index 0000000..e7a2467
+--- /dev/null
++++ b/app/src/app/api/viral-ideas/scan-status/[jobId]/route.ts
+@@ -0,0 +1,14 @@
++import { NextResponse } from "next/server";
++import { getScanJob } from "@/lib/scan-jobs";
++
++export async function GET(
++  _request: Request,
++  { params }: { params: Promise<{ jobId: string }> }
++) {
++  const { jobId } = await params;
++  const job = getScanJob(jobId);
++  if (!job) {
++    return NextResponse.json({ error: "Job not found" }, { status: 404 });
++  }
++  return NextResponse.json(job);
++}
+diff --git a/app/src/app/viral-ideas/page.tsx b/app/src/app/viral-ideas/page.tsx
+index 61c09b9..e7cd121 100644
+--- a/app/src/app/viral-ideas/page.tsx
++++ b/app/src/app/viral-ideas/page.tsx
+@@ -48,17 +48,15 @@ import { generateGradient, getInitials } from "@/lib/gradients";
+ import { sanitizeForDivido } from "@/lib/sanitize-script";
+ import type { ViralIdea, Creator } from "@/lib/types";
+ 
+-/** Pre-scan snapshot used to verify the real outcome after a client-side timeout. */
+-interface ScanBaseline {
+-  ideaTotal: number;
+-  ideaMain: number;
+-  ideaMaxDate: string | null;
+-  videoTotal: number;
+-  videoMaxDate: string | null;
+-}
+-
+-function isScanResult(data: unknown): data is { success: boolean; message?: string; error?: string } {
+-  return !!data && typeof data === "object" && "success" in data;
++/** Shape of a row from GET /api/viral-ideas/scan-status/:jobId */
++interface ScanJobStatus {
++  id: string;
++  status: "running" | "done" | "failed";
++  progressStep: string | null;
++  progressCurrent: number;
++  progressTotal: number;
++  result: { success: boolean; message?: string; error?: string; [key: string]: unknown } | null;
++  error: string | null;
+ }
+ 
+ function sleep(ms: number): Promise<void> {
+@@ -82,6 +80,7 @@ export default function ViralIdeasPage() {
+   const [detectResult, setDetectResult] = useState<any>(null);
+   const [scanningMain, setScanningMain] = useState(false);
+   const [scanResult, setScanResult] = useState<any>(null);
++  const [scanProgress, setScanProgress] = useState<ScanJobStatus | null>(null);
+   const [refreshingThumbnails, setRefreshingThumbnails] = useState(false);
+   const [refreshResult, setRefreshResult] = useState<string | null>(null);
+   const [creatingScriptId, setCreatingScriptId] = useState<string | null>(null);
+@@ -127,133 +126,77 @@ export default function ViralIdeasPage() {
+ 
+   /**
+    * Capture the state of viral ideas and videos before a scan starts, so we
+-   * can verify the real outcome if the request times out client-side.
+-   * dateDetected is the timestamp written when a new viral idea is created;
+-   * dateAdded is written when a new video is scraped (mid-scan, before
+-   * viral detection runs).
++   * can show real progress instead of a spinner with no information.
+    */
+-  const captureScanBaseline = async (): Promise<ScanBaseline | null> => {
+-    try {
+-      const [ideasRes, videosRes] = await Promise.all([
+-        fetch("/api/viral-ideas"),
+-        fetch("/api/videos"),
+-      ]);
+-      if (!ideasRes.ok || !videosRes.ok) return null;
+-      const ideas = (await ideasRes.json()) as ViralIdea[];
+-      const videos = (await videosRes.json()) as { dateAdded?: string }[];
+-      let ideaMain = 0;
+-      let ideaMaxDate: string | null = null;
+-      for (const idea of ideas) {
+-        if (mainCompetitorUsernames.has(idea.creator)) ideaMain++;
+-        if (idea.dateDetected && (!ideaMaxDate || idea.dateDetected > ideaMaxDate)) {
+-          ideaMaxDate = idea.dateDetected;
+-        }
+-      }
+-      let videoMaxDate: string | null = null;
+-      for (const video of videos) {
+-        if (video.dateAdded && (!videoMaxDate || video.dateAdded > videoMaxDate)) {
+-          videoMaxDate = video.dateAdded;
+-        }
+-      }
+-      return { ideaTotal: ideas.length, ideaMain, ideaMaxDate, videoTotal: videos.length, videoMaxDate };
+-    } catch {
+-      return null;
+-    }
+-  };
+-
+-  /**
+-   * After a client-side timeout/failure, poll until the scan's real output
+-   * lands (or the verification window expires) instead of guessing.
+-   * Returns the number of new viral ideas found, or null if nothing changed.
+-   */
+-  const verifyScanOutcome = async (before: ScanBaseline) => {
+-    await sleep(5000); // give the backend a few seconds before the first check
+-    const deadline = Date.now() + 10 * 60 * 1000; // scan may still be running — keep checking for 10 minutes
+-    let sawVideoActivity = false;
++  const pollScanJob = async (jobId: string): Promise<ScanJobStatus | null> => {
++    const deadline = Date.now() + 15 * 60 * 1000; // scans can legitimately run long — keep polling up to 15 minutes
+     while (Date.now() < deadline) {
+-      const after = await captureScanBaseline();
+-      if (after) {
+-        const newIdeas = after.ideaTotal > before.ideaTotal || after.ideaMain > before.ideaMain;
+-        const newerIdeaTimestamps = !!after.ideaMaxDate && after.ideaMaxDate > (before.ideaMaxDate ?? "");
+-        if (newIdeas || newerIdeaTimestamps) {
+-          // Viral ideas landed — report success with the real count.
+-          const mainDelta = Math.max(0, after.ideaMain - before.ideaMain);
+-          const totalDelta = Math.max(0, after.ideaTotal - before.ideaTotal);
+-          return { newCount: mainDelta > 0 ? mainDelta : totalDelta };
+-        }
+-        const newVideos = after.videoTotal > before.videoTotal;
+-        const newerVideoTimestamps = !!after.videoMaxDate && after.videoMaxDate > (before.videoMaxDate ?? "");
+-        if (newVideos || newerVideoTimestamps) {
+-          // Videos are being scraped — the scan is running, keep waiting for ideas to land.
+-          sawVideoActivity = true;
++      try {
++        const res = await fetch(`/api/viral-ideas/scan-status/${jobId}`);
++        if (res.ok) {
++          const job = (await res.json()) as ScanJobStatus;
++          setScanProgress(job);
++          if (job.status === "done" || job.status === "failed") {
++            return job;
++          }
+         }
++      } catch {
++        // transient network hiccup while polling — just try again next tick
+       }
+-      await sleep(15000);
+-    }
+-    if (sawVideoActivity) {
+-      // The scan ran (new videos were scraped) but produced no new viral ideas.
+-      return { newCount: 0 };
++      await sleep(3000);
+     }
+-    return null; // nothing changed — genuinely may not have completed
++    return null; // gave up waiting — scan may still be running server-side
+   };
+ 
+   const handleScanMainCompetitors = async () => {
+     setScanningMain(true);
+     setScanResult(null);
++    setScanProgress(null);
+ 
+-    // 1. Capture the current state BEFORE starting the scan
+-    const before = await captureScanBaseline();
+-
+-    let data: unknown = null;
++    // The route responds immediately with a jobId (202) — the actual
++    // scrape+analyze+script work keeps running server-side afterward, so
++    // this request can never hit the Cloudflare gateway timeout itself.
++    let jobId: string | null = null;
+     try {
+       const response = await fetch("/api/viral-ideas/scan-main-competitors", {
+         method: "POST",
+         headers: { "Content-Type": "application/json" },
+         body: JSON.stringify({}),
+       });
+-      try {
+-        data = await response.json();
+-      } catch {
+-        data = null; // proxy timeout pages (524/504) have no JSON body
+-      }
++      const data = await response.json().catch(() => null);
++      jobId = data?.jobId ?? null;
+     } catch {
+-      // Network failure / client-side timeout — the backend may still be running.
+-      // Do NOT report failure yet; verify the actual outcome below.
+-      data = null;
++      jobId = null;
+     }
+ 
+-    if (isScanResult(data) && data.success) {
+-      setScanResult(data);
+-      loadIdeas();
+-      setFilterTab("main"); // Auto-switch to main competitors tab
++    if (!jobId) {
++      setScanResult({ success: false, error: "Could not start the scan — no job was created. Check your connection and try again." });
+       setScanningMain(false);
+       return;
+     }
+ 
+-    if (isScanResult(data)) {
+-      // Definitive backend answer (e.g. no main competitors configured)
+-      setScanResult(data);
+-      setScanningMain(false);
+-      return;
+-    }
++    const job = await pollScanJob(jobId);
++    setScanProgress(null);
+ 
+-    // 2. Request failed or timed out client-side — verify the real outcome
+-    const verified = before ? await verifyScanOutcome(before) : null;
+-    if (verified) {
+-      setScanResult({
+-        success: true,
+-        message: verified.newCount > 0
+-          ? `Scan completed in the background — found ${verified.newCount} new viral ideas`
+-          : "Scan completed — no new viral ideas found",
+-      });
+-      loadIdeas();
+-      setFilterTab("main"); // Auto-switch to main competitors tab
+-    } else {
++    if (!job) {
+       setScanResult({
+         success: false,
+-        error: "Failed to scan main competitors — no new viral ideas or videos appeared after waiting. The scan may still be running in the background; refresh in a few minutes.",
++        error: "Still scanning after 15 minutes of waiting — it may still finish in the background. Refresh the page in a few minutes to check.",
+       });
++      setScanningMain(false);
++      return;
++    }
++
++    if (job.status === "failed") {
++      setScanResult({ success: false, error: job.error || "Scan failed for an unknown reason." });
++      setScanningMain(false);
++      return;
+     }
++
++    // job.status === "done"
++    setScanResult(job.result || { success: true, message: "Scan completed." });
++    loadIdeas();
++    setFilterTab("main"); // Auto-switch to main competitors tab
+     setScanningMain(false);
+   };
+ 
+@@ -376,7 +319,12 @@ export default function ViralIdeasPage() {
+             className="bg-gradient-to-r from-red-600 to-orange-600 hover:from-red-700 hover:to-orange-700 text-white border border-red-400/30"
+           >
+             {scanningMain ? (
+-              <><Zap className="w-4 h-4 mr-2 animate-pulse" />Scanning... this may take a few minutes</>
++              <>
++                <Zap className="w-4 h-4 mr-2 animate-pulse" />
++                {scanProgress?.progressStep
++                  ? `${scanProgress.progressStep}${scanProgress.progressTotal ? ` (${scanProgress.progressCurrent}/${scanProgress.progressTotal})` : ""}`
++                  : "Starting scan..."}
++              </>
+             ) : (
+               <><Flame className="w-4 h-4 mr-2" />Scan Main Competitors</>
+             )}
+diff --git a/app/src/lib/csv.ts b/app/src/lib/csv.ts
+index 89e727c..2f8019f 100644
+--- a/app/src/lib/csv.ts
++++ b/app/src/lib/csv.ts
+@@ -110,6 +110,17 @@ export function appendVideo(video: Video, workspaceId = DEFAULT_WORKSPACE): void
+   ins.run(video.id, workspaceId, video.link, video.thumbnail, video.creator, video.views, video.likes, video.comments, video.analysis, video.newConcepts, video.datePosted, video.dateAdded, video.configName, video.starred ? 1 : 0);
+ }
+ 
++/**
++ * Patch just the `analysis` field for a single video, in place.
++ * Used after scraping, once the original-video AI analysis (hook/body/CTA
++ * source material) comes back — avoids a full readVideos()/writeVideos()
++ * round trip for every video in a scan.
++ */
++export function updateVideoAnalysis(videoId: string, analysis: string, workspaceId = DEFAULT_WORKSPACE): void {
++  const db = getDb();
++  db.prepare("UPDATE videos SET analysis = ? WHERE id = ? AND workspace_id = ?").run(analysis, videoId, workspaceId);
++}
++
+ // ─────────────────────── Strategies ───────────────────────
+ 
+ export function readStrategies(workspaceId?: string): Strategy[] {
+diff --git a/app/src/lib/db.ts b/app/src/lib/db.ts
+index dad3dca..d11d92d 100644
+--- a/app/src/lib/db.ts
++++ b/app/src/lib/db.ts
+@@ -306,4 +306,23 @@ CREATE TABLE IF NOT EXISTS usage_records (
+   timestamp TEXT,
+   details TEXT
+ );
++
++-- Background scan jobs (e.g. "Scan Main Competitors"). Lets a slow scrape+AI
++-- pipeline run past the Cloudflare/proxy request timeout: the POST route
++-- creates a row and returns immediately, the actual work updates this row
++-- as it progresses, and the frontend polls GET /scan-status/:id instead of
++-- holding one long-lived request open.
++CREATE TABLE IF NOT EXISTS scan_jobs (
++  id TEXT PRIMARY KEY,
++  workspace_id TEXT NOT NULL REFERENCES workspaces(id),
++  status TEXT NOT NULL DEFAULT 'running', -- running | done | failed
++  configName TEXT,
++  progressStep TEXT,
++  progressCurrent INTEGER DEFAULT 0,
++  progressTotal INTEGER DEFAULT 0,
++  result TEXT,
++  error TEXT,
++  createdAt TEXT NOT NULL,
++  updatedAt TEXT NOT NULL
++);
+ `;
+diff --git a/app/src/lib/scan-jobs.ts b/app/src/lib/scan-jobs.ts
+new file mode 100644
+index 0000000..f26f2ad
+--- /dev/null
++++ b/app/src/lib/scan-jobs.ts
+@@ -0,0 +1,95 @@
++import { getDb, ensureSchema } from "./db";
++import { v4 as uuid } from "uuid";
++
++const DEFAULT_WORKSPACE = "default";
++
++export type ScanJobStatus = "running" | "done" | "failed";
++
++export interface ScanJob {
++  id: string;
++  status: ScanJobStatus;
++  configName: string | null;
++  progressStep: string | null;
++  progressCurrent: number;
++  progressTotal: number;
++  result: unknown | null;
++  error: string | null;
++  createdAt: string;
++  updatedAt: string;
++}
++
++function rowToJob(row: any): ScanJob {
++  return {
++    id: row.id,
++    status: row.status,
++    configName: row.configName,
++    progressStep: row.progressStep,
++    progressCurrent: row.progressCurrent ?? 0,
++    progressTotal: row.progressTotal ?? 0,
++    result: row.result ? JSON.parse(row.result) : null,
++    error: row.error,
++    createdAt: row.createdAt,
++    updatedAt: row.updatedAt,
++  };
++}
++
++export function createScanJob(configName: string | undefined, workspaceId = DEFAULT_WORKSPACE): string {
++  ensureSchema();
++  const db = getDb();
++  const id = uuid();
++  const now = new Date().toISOString();
++  db.prepare(
++    `INSERT INTO scan_jobs (id, workspace_id, status, configName, progressStep, progressCurrent, progressTotal, createdAt, updatedAt)
++     VALUES (?, ?, 'running', ?, 'Starting scan...', 0, 0, ?, ?)`
++  ).run(id, workspaceId, configName || null, now, now);
++  return id;
++}
++
++export function updateScanJobProgress(
++  id: string,
++  progress: { step?: string; current?: number; total?: number }
++): void {
++  const db = getDb();
++  const now = new Date().toISOString();
++  const existing = db.prepare("SELECT * FROM scan_jobs WHERE id = ?").get(id) as any;
++  if (!existing) return;
++  db.prepare(
++    `UPDATE scan_jobs SET progressStep = ?, progressCurrent = ?, progressTotal = ?, updatedAt = ? WHERE id = ?`
++  ).run(
++    progress.step ?? existing.progressStep,
++    progress.current ?? existing.progressCurrent,
++    progress.total ?? existing.progressTotal,
++    now,
++    id
++  );
++}
++
++export function completeScanJob(id: string, result: unknown): void {
++  const db = getDb();
++  const now = new Date().toISOString();
++  db.prepare(
++    `UPDATE scan_jobs SET status = 'done', result = ?, progressStep = 'Complete', updatedAt = ? WHERE id = ?`
++  ).run(JSON.stringify(result), now, id);
++}
++
++export function failScanJob(id: string, error: string): void {
++  const db = getDb();
++  const now = new Date().toISOString();
++  db.prepare(
++    `UPDATE scan_jobs SET status = 'failed', error = ?, updatedAt = ? WHERE id = ?`
++  ).run(error, now, id);
++}
++
++export function getScanJob(id: string): ScanJob | null {
++  ensureSchema();
++  const db = getDb();
++  const row = db.prepare("SELECT * FROM scan_jobs WHERE id = ?").get(id);
++  return row ? rowToJob(row) : null;
++}
++
++/** Best-effort cleanup so scan_jobs doesn't grow forever — call occasionally, not on every request. */
++export function pruneOldScanJobs(olderThanHours = 48): void {
++  const db = getDb();
++  const cutoff = new Date(Date.now() - olderThanHours * 60 * 60 * 1000).toISOString();
++  db.prepare("DELETE FROM scan_jobs WHERE createdAt < ?").run(cutoff);
++}
+diff --git a/app/src/lib/video-analysis.ts b/app/src/lib/video-analysis.ts
+new file mode 100644
+index 0000000..c271ba1
+--- /dev/null
++++ b/app/src/lib/video-analysis.ts
+@@ -0,0 +1,78 @@
++import { getProviderForTask } from "./ai-providers/factory";
++import type { AIUserSettings } from "./ai-providers/types";
++import type { Config } from "./types";
++
++/**
++ * Analyze a competitor's original video to produce the source material for
++ * the "Original" tab, the Side-by-Side competitor column, and hook/body/CTA
++ * extraction.
++ *
++ * Two paths, same pattern already proven in app/api/analyze-reel/route.ts:
++ *  1. Real video analysis via Gemini (native multimodal — actually watches
++ *     the video). Requires GEMINI_API_KEY / a Gemini key in Settings.
++ *  2. Text-based inference fallback — no video download, just asks the
++ *     already-working script-generation provider (opencode-go by default)
++ *     to infer the likely hook/body/CTA from caption, hashtags, and
++ *     engagement metrics. Always available, lower fidelity.
++ *
++ * Never throws — on any failure it falls through to the text path, and if
++ * that also fails, returns null so the caller can save an honest
++ * "analysis not available" state instead of crashing the scan.
++ */
++export async function analyzeOriginalVideo(
++  video: { videoUrl?: string; caption?: string; hashtags?: string[]; views: number; likes: number; comments: number; username: string },
++  analysisInstruction: string,
++  aiSettings?: AIUserSettings
++): Promise<string | null> {
++  // 1. Try real video analysis via Gemini, if a video URL was scraped.
++  if (video.videoUrl) {
++    try {
++      const videoProvider = await getProviderForTask("video-analysis", aiSettings);
++      const response = await fetch(video.videoUrl, { redirect: "follow" });
++      if (response.ok) {
++        const buffer = Buffer.from(await response.arrayBuffer());
++        // Small/empty downloads are almost always a broken CDN link, not a real clip.
++        if (buffer.length >= 10000) {
++          const analysis = await videoProvider.analyzeVideo(buffer, "video/mp4", analysisInstruction);
++          if (analysis && analysis.trim()) return analysis;
++        }
++      }
++    } catch {
++      // Gemini not configured, quota hit, download failed, etc. — fall through to text.
++    }
++  }
++
++  // 2. Text-based inference fallback — always available once opencode-go (or
++  // any script provider) is configured, since it's a plain text call.
++  try {
++    const scriptProvider = await getProviderForTask("script-generation", aiSettings);
++    const textPrompt = `Analyze this Instagram Reel based on its metadata and generate a 7 Bricks analysis.
++
++POST METADATA:
++- Creator: @${video.username}
++- Caption: ${video.caption || "(no caption)"}
++- Hashtags: ${video.hashtags?.join(", ") || "(none)"}
++- Views: ${video.views.toLocaleString()}
++- Likes: ${video.likes.toLocaleString()}
++- Comments: ${video.comments.toLocaleString()}
++
++${analysisInstruction}
++
++Generate a complete analysis based on this metadata, including a clearly-labeled HOOK, BODY, and CTA section (use "**HOOK:**", then a "**SCRIPT:**" section covering body and CTA). Make educated, clearly-inferred assumptions about the video's structure and viral mechanics based on the caption, hashtags, and engagement — since the raw video wasn't available for direct viewing, keep claims grounded in what the metadata actually supports.`;
++
++    const analysis = await scriptProvider.generateScript("", textPrompt, undefined);
++    if (analysis && analysis.trim()) return analysis;
++  } catch {
++    // Both paths failed — caller saves an honest empty/pending state.
++  }
++
++  return null;
++}
++
++/** Default 7-Bricks-style instruction used when no config.analysisInstruction is set. */
++export function defaultAnalysisInstruction(config?: Config): string {
++  return (
++    config?.analysisInstruction ||
++    "Analyze this video's viral mechanics using a 7 Bricks framework: Topic, Angle, Hook, Story Structure, Visual Format, Key Visuals, Audio. Identify the 2-3 'winning bricks' that most likely drove its performance."
++  );
++}
+-- 
+2.43.0
+
